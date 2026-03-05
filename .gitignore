@@ -1,0 +1,7 @@
+.env
+*.env
+serviceAccountKey.json
+api
+api.exe
+bin/api
+.DS_Store
