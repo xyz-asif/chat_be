@@ -19,19 +19,12 @@ func NewHandler(service Service) *Handler {
 
 // WsUpgrade handles the initial HTTP request and upgrades it to a WebSocket connection
 func (h *Handler) WsUpgrade(c *fiber.Ctx) error {
-	// The auth token is passed as a query param or header.
-	// We rely on the authMiddleware to inject the user into c.Locals BEFORE this runs
-	// but WebSockets limits header changes in browser JS. So often we verify via query params like ?token=
-	// Let's assume standard auth middleware handles it and sets c.Locals("user")
-
 	user, ok := c.Locals("user").(*models.User)
 	if !ok {
 		return response.Unauthorized(c, "Unauthorized access to websocket")
 	}
 
-	// Ensure the connection is a valid websocket upgrade request
 	if websocket.IsWebSocketUpgrade(c) {
-		// Set the user ID into the local context so it survives the upgrade
 		c.Locals("userID", user.ID.Hex())
 		return c.Next()
 	}
@@ -40,14 +33,11 @@ func (h *Handler) WsUpgrade(c *fiber.Ctx) error {
 
 // WebSocketHandle is the Fiber WebSocket handler itself
 func (h *Handler) WebSocketHandle(c *websocket.Conn) {
-	// Extract the userID injected during WsUpgrade phase
 	userID, ok := c.Locals("userID").(string)
 	if !ok {
 		log.Println("WS Error: User ID missing in websocket context")
 		return
 	}
-
-	// Let the service process the connection
 	h.service.HandleWebSocket(c, userID)
 }
 
@@ -88,11 +78,16 @@ func (h *Handler) GetUserRooms(c *fiber.Ctx) error {
 
 // GetRoomMessages HTTP Endpoint to fetch history
 func (h *Handler) GetRoomMessages(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
 	roomID := c.Params("roomId")
 	limit := c.QueryInt("limit", 50)
 	offset := c.QueryInt("offset", 0)
 
-	msgs, err := h.service.GetRoomMessages(c.Context(), roomID, limit, offset)
+	msgs, err := h.service.GetRoomMessages(c.Context(), user.ID.Hex(), roomID, limit, offset)
 	if err != nil {
 		return response.BadRequest(c, err.Error())
 	}
@@ -100,7 +95,7 @@ func (h *Handler) GetRoomMessages(c *fiber.Ctx) error {
 	return response.OK(c, "Messages retrieved", msgs)
 }
 
-// SendMessage HTTP Endpoint (Optional fallback instead of WebSocket)
+// SendMessage HTTP Endpoint
 func (h *Handler) SendMessage(c *fiber.Ctx) error {
 	user, ok := c.Locals("user").(*models.User)
 	if !ok {
@@ -109,16 +104,133 @@ func (h *Handler) SendMessage(c *fiber.Ctx) error {
 
 	roomID := c.Params("roomId")
 	var req struct {
+		Content   string `json:"content"`
+		ReplyToID string `json:"replyToId,omitempty"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	msg, err := h.service.SendMessage(c.Context(), user.ID.Hex(), roomID, req.Content, req.ReplyToID)
+	if err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.Created(c, "Message sent", msg)
+}
+
+// UpdateMessageStatus Endpoint (`PATCH /api/v1/chat/messages/:messageId/status`)
+func (h *Handler) UpdateMessageStatus(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	messageID := c.Params("messageId")
+	var req struct {
+		Status string `json:"status"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if err := h.service.UpdateMessageStatus(c.Context(), user.ID.Hex(), messageID, req.Status); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Message status updated", nil)
+}
+
+// UpdateMessageReaction Endpoint (`PUT /api/v1/chat/messages/:messageId/reactions`)
+func (h *Handler) UpdateMessageReaction(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	messageID := c.Params("messageId")
+	var req struct {
+		Emoji string `json:"emoji"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.BadRequest(c, "Invalid request body")
+	}
+
+	if err := h.service.UpdateMessageReaction(c.Context(), user.ID.Hex(), messageID, req.Emoji); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Message reaction updated", nil)
+}
+
+// GetUserPresence Endpoint (`GET /api/v1/chat/users/:id/presence`)
+func (h *Handler) GetUserPresence(c *fiber.Ctx) error {
+	_, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	targetUserId := c.Params("id")
+	if targetUserId == "" {
+		return response.BadRequest(c, "target user ID is required")
+	}
+
+	presence, err := h.service.GetUserPresence(c.Context(), targetUserId)
+	if err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Presence retrieved", presence)
+}
+
+// MarkRoomAsRead Endpoint (`POST /api/v1/chat/rooms/:roomId/read`)
+func (h *Handler) MarkRoomAsRead(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	roomID := c.Params("roomId")
+	if err := h.service.MarkRoomAsRead(c.Context(), user.ID.Hex(), roomID); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Room marked as read", nil)
+}
+
+// EditMessage Endpoint (`PATCH /api/v1/chat/messages/:messageId`)
+func (h *Handler) EditMessage(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	messageID := c.Params("messageId")
+	var req struct {
 		Content string `json:"content"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return response.BadRequest(c, "Invalid request body")
 	}
 
-	msg, err := h.service.SendMessage(c.Context(), user.ID.Hex(), roomID, req.Content)
-	if err != nil {
+	if err := h.service.EditMessage(c.Context(), user.ID.Hex(), messageID, req.Content); err != nil {
 		return response.BadRequest(c, err.Error())
 	}
 
-	return response.Created(c, "Message sent", msg)
+	return response.OK(c, "Message edited", nil)
+}
+
+// DeleteMessage Endpoint (`DELETE /api/v1/chat/messages/:messageId`)
+func (h *Handler) DeleteMessage(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	messageID := c.Params("messageId")
+	if err := h.service.DeleteMessage(c.Context(), user.ID.Hex(), messageID); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Message deleted", nil)
 }

@@ -21,23 +21,36 @@ const (
 
 // Room represents a chat conversation container
 type Room struct {
-	ID           bson.ObjectID   `bson:"_id,omitempty" json:"id"`
-	Type         string          `bson:"type" json:"type"`                     // "direct" or "group"
-	Name         string          `bson:"name,omitempty" json:"name,omitempty"` // For groups
-	Participants []bson.ObjectID `bson:"participants" json:"participants"`
-	LastMessage  string          `bson:"lastMessage,omitempty" json:"lastMessage,omitempty"`
-	LastUpdated  time.Time       `bson:"lastUpdated" json:"lastUpdated"`
-	CreatedAt    time.Time       `bson:"createdAt" json:"createdAt"`
+	ID                  bson.ObjectID   `bson:"_id,omitempty" json:"id"`
+	Type                string          `bson:"type" json:"type"`                     // "direct" or "group"
+	Name                string          `bson:"name,omitempty" json:"name,omitempty"` // For groups
+	Participants        []bson.ObjectID `bson:"participants" json:"participants"`
+	LastMessage         string          `bson:"lastMessage,omitempty" json:"lastMessage,omitempty"`
+	LastMessageSenderID *bson.ObjectID  `bson:"lastMessageSenderId,omitempty" json:"lastMessageSenderId,omitempty"`
+	UnreadCounts        map[string]int  `bson:"unreadCounts,omitempty" json:"unreadCounts,omitempty"` // map[userIDHex]count
+	LastUpdated         time.Time       `bson:"lastUpdated" json:"lastUpdated"`
+	CreatedAt           time.Time       `bson:"createdAt" json:"createdAt"`
+}
+
+// ParticipantInfo is used in RoomResponse to include user details + online status
+type ParticipantInfo struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+	PhotoURL    string `json:"photoURL,omitempty"`
+	Email       string `json:"email"`
+	IsOnline    bool   `json:"isOnline"`
 }
 
 // RoomResponse is used to send room details with populated participant info to the client
 type RoomResponse struct {
-	ID           string    `json:"id"`
-	Type         string    `json:"type"`
-	Name         string    `json:"name,omitempty"`
-	Participants []User    `json:"participants"`
-	LastMessage  string    `json:"lastMessage,omitempty"`
-	LastUpdated  time.Time `json:"lastUpdated"`
+	ID                    string            `json:"id"`
+	Type                  string            `json:"type"`
+	Name                  string            `json:"name,omitempty"`
+	Participants          []ParticipantInfo `json:"participants"`
+	LastMessage           string            `json:"lastMessage,omitempty"`
+	LastMessageSenderName string            `json:"lastMessageSenderName,omitempty"` // e.g. "Alice"
+	UnreadCount           int               `json:"unreadCount"`
+	LastUpdated           time.Time         `json:"lastUpdated"`
 }
 
 // Message represents an individual chat message
@@ -49,6 +62,8 @@ type Message struct {
 	Status    string            `bson:"status" json:"status"`                           // sent, delivered, read
 	Reactions map[string]string `bson:"reactions,omitempty" json:"reactions,omitempty"` // map[userID]emoji
 	ReplyToID *bson.ObjectID    `bson:"replyToId,omitempty" json:"replyToId,omitempty"`
+	IsEdited  bool              `bson:"isEdited,omitempty" json:"isEdited,omitempty"`
+	IsDeleted bool              `bson:"isDeleted,omitempty" json:"isDeleted,omitempty"`
 	CreatedAt time.Time         `bson:"createdAt" json:"createdAt"`
 	UpdatedAt time.Time         `bson:"updatedAt,omitempty" json:"updatedAt,omitempty"`
 }
@@ -62,6 +77,8 @@ type MessageResponse struct {
 	Status    string            `json:"status"`
 	Reactions map[string]string `json:"reactions,omitempty"`
 	ReplyTo   *MessageResponse  `json:"replyTo,omitempty"` // Optional nested reply
+	IsEdited  bool              `json:"isEdited,omitempty"`
+	IsDeleted bool              `json:"isDeleted,omitempty"`
 	CreatedAt time.Time         `json:"createdAt"`
 	UpdatedAt time.Time         `json:"updatedAt,omitempty"`
 }

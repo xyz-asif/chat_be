@@ -22,7 +22,7 @@ func LoadConfig() (*Config, error) {
 
 	// Set defaults
 	viper.SetDefault("PORT", "8080")
-	viper.SetDefault("DATABASE_NAME", "anchor_db")
+	viper.SetDefault("DATABASE_NAME", "chat_db")
 
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {

@@ -48,7 +48,7 @@ func main() {
 	// Initialize services
 	userService := users.NewService(userRepo)
 	connectionService := connections.NewService(connectionRepo)
-	chatService := chat.NewService(chatRepo, userRepo, chatHub)
+	chatService := chat.NewService(chatRepo, userRepo, connectionRepo, chatHub)
 
 	// Initialize handlers
 	userHandler := users.NewHandler(userService)
