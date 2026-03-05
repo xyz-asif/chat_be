@@ -14,6 +14,7 @@ type Service interface {
 	UpdateProfile(ctx context.Context, userID string, updates map[string]interface{}) (*models.User, error)
 	FollowUser(ctx context.Context, followerID, followedUserID string) error
 	UnfollowUser(ctx context.Context, followerID, followedUserID string) error
+	SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error)
 	GetFeed(ctx context.Context, userID string) ([]interface{}, error)
 }
 
@@ -127,6 +128,24 @@ func (s *service) UnfollowUser(ctx context.Context, followerID, followedUserID s
 	}
 
 	return s.repo.UnfollowUser(ctx, fID, targetID)
+}
+
+func (s *service) SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	if query == "" {
+		return []models.User{}, nil
+	}
+
+	return s.repo.SearchUsers(ctx, query, limit, offset)
 }
 
 // Placeholder for feed

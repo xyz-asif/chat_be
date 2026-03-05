@@ -7,6 +7,7 @@ toolchain go1.24.1
 require (
 	firebase.google.com/go/v4 v4.18.0
 	github.com/gin-gonic/gin v1.10.1
+	github.com/gofiber/contrib/websocket v1.3.4
 	github.com/gofiber/fiber/v2 v2.52.10
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/spf13/viper v1.21.0
@@ -92,7 +93,6 @@ require (
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-playground/validator/v10 v10.27.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
-	github.com/gofiber/contrib/websocket v1.3.4 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect

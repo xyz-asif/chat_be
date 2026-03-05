@@ -8,6 +8,7 @@ import (
 	"github.com/xyz-asif/gotodo/internal/models"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type Repository interface {
@@ -16,9 +17,9 @@ type Repository interface {
 	GetUserByID(ctx context.Context, id bson.ObjectID) (*models.User, error)
 	UpdateUser(ctx context.Context, id bson.ObjectID, updates map[string]interface{}) error // MVP Feature: User Profile Management
 	IncrementProfileViews(ctx context.Context, userID bson.ObjectID) error                  // MVP Feature: User Profile Management
-	GetFollowedUsers(ctx context.Context, userID bson.ObjectID) ([]bson.ObjectID, error)
 	FollowUser(ctx context.Context, followerID, followedID bson.ObjectID) error
 	UnfollowUser(ctx context.Context, followerID, followedID bson.ObjectID) error
+	SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error)
 }
 
 type repository struct {
@@ -155,7 +156,6 @@ func (r *repository) FollowUser(ctx context.Context, followerID, followedUserID 
 
 // MVP Launch: User-to-User Follow System - Completed
 func (r *repository) UnfollowUser(ctx context.Context, followerID, followedUserID bson.ObjectID) error {
-	// Execute in transaction
 	session, err := r.client.StartSession()
 	if err != nil {
 		return err
@@ -188,4 +188,33 @@ func (r *repository) UnfollowUser(ctx context.Context, followerID, followedUserI
 	})
 
 	return err
+}
+
+func (r *repository) SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error) {
+	// Create a case-insensitive regex search on email or displayName
+	filter := bson.M{
+		"$or": []bson.M{
+			{"displayName": bson.M{"$regex": query, "$options": "i"}},
+			{"email": bson.M{"$regex": query, "$options": "i"}},
+		},
+		"isActive": true, // Only return active users
+	}
+
+	importOptions := options.Find().
+		SetLimit(int64(limit)).
+		SetSkip(int64(offset)).
+		SetSort(bson.D{{Key: "displayName", Value: 1}}) // Sort alphabetically
+
+	cursor, err := r.collection.Find(ctx, filter, importOptions)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var users []models.User
+	if err := cursor.All(ctx, &users); err != nil {
+		return nil, err
+	}
+
+	return users, nil
 }

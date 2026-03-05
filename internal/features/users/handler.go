@@ -93,3 +93,17 @@ func (h *Handler) UnfollowUser(c *fiber.Ctx) error {
 
 	return response.OK(c, "Unfollowed successfully", nil)
 }
+
+// Search Users
+func (h *Handler) Search(c *fiber.Ctx) error {
+	query := c.Query("q", "")
+	limit := c.QueryInt("limit", 20)
+	offset := c.QueryInt("offset", 0)
+
+	users, err := h.service.SearchUsers(c.Context(), query, limit, offset)
+	if err != nil {
+		return response.InternalError(c, err.Error())
+	}
+
+	return response.OK(c, "Users retrieved", users)
+}

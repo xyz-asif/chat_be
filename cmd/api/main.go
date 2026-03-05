@@ -10,6 +10,8 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/xyz-asif/gotodo/internal/config"
 	"github.com/xyz-asif/gotodo/internal/database"
+	"github.com/xyz-asif/gotodo/internal/features/chat"
+	"github.com/xyz-asif/gotodo/internal/features/connections"
 	"github.com/xyz-asif/gotodo/internal/features/users"
 	"github.com/xyz-asif/gotodo/internal/middleware"
 	"github.com/xyz-asif/gotodo/internal/routes"
@@ -36,12 +38,22 @@ func main() {
 
 	// 4. Setup Repositories
 	userRepo := users.NewRepository(db.Database)
+	connectionRepo := connections.NewRepository(db.Database)
+	chatRepo := chat.NewRepository(db.Database)
+
+	// Initialize WebSockets Hub
+	chatHub := chat.NewHub()
+	go chatHub.Run() // Run the hub in a background goroutine
 
 	// Initialize services
 	userService := users.NewService(userRepo)
+	connectionService := connections.NewService(connectionRepo)
+	chatService := chat.NewService(chatRepo, userRepo, chatHub)
 
 	// Initialize handlers
 	userHandler := users.NewHandler(userService)
+	connectionHandler := connections.NewHandler(connectionService)
+	chatHandler := chat.NewHandler(chatService)
 
 	// 5. Setup Middleware
 	authMiddleware, err := middleware.NewAuthMiddleware(cfg.FirebaseCredsPath, cfg.FirebaseProjectID, userService)
@@ -69,8 +81,9 @@ func main() {
 		app,
 		authMiddleware,
 		userHandler,
+		connectionHandler,
+		chatHandler,
 	)
-
 	// 8. Start Server
 	log.Printf("🚀 Starting Chat API on port %s", cfg.Port)
 	if err := app.Listen(":" + cfg.Port); err != nil {
