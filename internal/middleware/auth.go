@@ -40,13 +40,19 @@ func NewAuthMiddleware(credPath, projectID string, userService users.Service) (*
 
 func (am *AuthMiddleware) VerifyToken(c *fiber.Ctx) error {
 	authHeader := c.Get("Authorization")
-	if authHeader == "" {
-		return response.Unauthorized(c, "Missing Authorization header")
-	}
+	token := ""
 
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-	if token == authHeader {
-		return response.Unauthorized(c, "Invalid Authorization header format")
+	if authHeader != "" {
+		token = strings.TrimPrefix(authHeader, "Bearer ")
+		if token == authHeader {
+			return response.Unauthorized(c, "Invalid Authorization header format")
+		}
+	} else {
+		// Check for token in query parameter (for WebSocket connections)
+		token = c.Query("token")
+		if token == "" {
+			return response.Unauthorized(c, "Missing Authorization header")
+		}
 	}
 
 	client, err := am.App.Auth(c.Context())
