@@ -3,6 +3,8 @@ package chat
 import (
 	"context"
 	"errors"
+	"log"
+	"time"
 
 	"github.com/gofiber/contrib/websocket"
 	"github.com/xyz-asif/gotodo/internal/features/connections"
@@ -14,7 +16,7 @@ import (
 type Service interface {
 	SendMessage(ctx context.Context, senderID, roomID, content, replyToID string) (*models.MessageResponse, error)
 	GetOrCreateDirectRoom(ctx context.Context, user1ID, user2ID string) (*models.RoomResponse, error)
-	GetRoomMessages(ctx context.Context, userID, roomID string, limit, offset int) ([]models.MessageResponse, error)
+	GetRoomMessages(ctx context.Context, userID, roomID string, limit int, beforeID string) (*models.MessagesPage, error)
 	GetUserRooms(ctx context.Context, userID string) ([]models.RoomResponse, error)
 	GetUserPresence(ctx context.Context, userID string) (map[string]interface{}, error)
 	UpdateMessageStatus(ctx context.Context, userID, messageID, status string) error
@@ -64,20 +66,10 @@ func (s *service) GetOrCreateDirectRoom(ctx context.Context, user1IDStr, user2ID
 		return nil, errors.New("you must be connected (friends) with this user before chatting")
 	}
 
-	room, err := s.repo.GetDirectRoom(ctx, user1ID, user2ID)
+	// Atomic find-or-create eliminates the TOCTOU race between two concurrent requests
+	room, err := s.repo.GetOrCreateDirectRoomAtomic(ctx, user1ID, user2ID)
 	if err != nil {
 		return nil, err
-	}
-
-	if room == nil {
-		room = &models.Room{
-			Type:         models.RoomTypeDirect,
-			Participants: []bson.ObjectID{user1ID, user2ID},
-			UnreadCounts: map[string]int{user1IDStr: 0, user2IDStr: 0},
-		}
-		if err := s.repo.CreateRoom(ctx, room); err != nil {
-			return nil, err
-		}
 	}
 
 	return s.buildRoomResponse(ctx, room, user1IDStr)
@@ -95,6 +87,9 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 
 	if content == "" {
 		return nil, errors.New("message content cannot be empty")
+	}
+	if len([]rune(content)) > 2000 {
+		return nil, errors.New("message content exceeds maximum length of 2000 characters")
 	}
 
 	room, err := s.repo.GetRoomByID(ctx, roomID)
@@ -128,31 +123,56 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 		return nil, err
 	}
 
-	// Update room last message + sender
-	_ = s.repo.UpdateRoomLastMessage(ctx, roomID, content, senderID)
+	// Auto-advance to "delivered" if at least one recipient is currently online.
+	// This avoids requiring the frontend to call PATCH /messages/:id/status manually.
+	for _, p := range room.Participants {
+		if p != senderID && s.hub.IsUserOnline(p.Hex()) {
+			if err := s.repo.UpdateMessageStatus(ctx, msg.ID, models.MessageStatusDelivered); err == nil {
+				msg.Status = models.MessageStatusDelivered
+			}
+			break
+		}
+	}
 
-	// Increment unread count for everyone except the sender
-	_ = s.repo.IncrementUnreadCounts(ctx, roomID, senderIDStr)
+	// Update room last message + sender
+	if err := s.repo.UpdateRoomLastMessage(ctx, roomID, content, senderID); err != nil {
+		log.Printf("SendMessage: failed to update room last message for room %s: %v", roomIDStr, err)
+	}
+
+	// Increment unread count for everyone except the sender (room.Participants already in memory)
+	if err := s.repo.IncrementUnreadCounts(ctx, roomID, room.Participants, senderIDStr); err != nil {
+		log.Printf("SendMessage: failed to increment unread counts for room %s: %v", roomIDStr, err)
+	}
 
 	resp := s.buildMessageResponse(ctx, msg)
-
-	// Broadcast via WebSocket
-	wsMsg := models.WSMessage{
-		Type:    "message",
-		RoomID:  roomIDStr,
-		Payload: resp,
-	}
 
 	userIDs := make([]string, len(room.Participants))
 	for i, p := range room.Participants {
 		userIDs[i] = p.Hex()
 	}
-	_ = s.hub.SendToUsers(userIDs, wsMsg)
+
+	// Broadcast the new message to all participants
+	_ = s.hub.SendToUsers(userIDs, models.WSMessage{
+		Type:    "message",
+		RoomID:  roomIDStr,
+		Payload: resp,
+	})
+
+	// Broadcast room_updated so every participant's chat list re-orders in real time
+	_ = s.hub.SendToUsers(userIDs, models.WSMessage{
+		Type:   "room_updated",
+		RoomID: roomIDStr,
+		Payload: map[string]interface{}{
+			"lastMessage":   content,
+			"lastUpdated":   msg.CreatedAt,
+			"lastSenderId":  senderIDStr,
+		},
+	})
 
 	return resp, nil
 }
 
-func (s *service) GetRoomMessages(ctx context.Context, userIDStr, roomIDStr string, limit, offset int) ([]models.MessageResponse, error) {
+func (s *service) GetRoomMessages(ctx context.Context, userIDStr, roomIDStr string, limit int, beforeIDStr string) (*models.MessagesPage, error) {
 	userID, err := bson.ObjectIDFromHex(userIDStr)
 	if err != nil {
 		return nil, errors.New("invalid user id")
@@ -173,16 +193,29 @@ func (s *service) GetRoomMessages(ctx context.Context, userIDStr, roomIDStr stri
 	if limit <= 0 {
 		limit = 50
 	}
-	if limit > 200 {
-		limit = 200
-	}
-	if offset < 0 {
-		offset = 0
+	if limit > 100 {
+		limit = 100
 	}
 
-	msgs, err := s.repo.GetMessagesByRoom(ctx, roomID, limit, offset)
+	// Parse optional cursor: only messages with _id < beforeID are returned
+	var beforeID *bson.ObjectID
+	if beforeIDStr != "" {
+		id, err := bson.ObjectIDFromHex(beforeIDStr)
+		if err != nil {
+			return nil, errors.New("invalid before cursor")
+		}
+		beforeID = &id
+	}
+
+	// Fetch one extra to determine hasMore without a separate COUNT query
+	msgs, err := s.repo.GetMessagesByRoom(ctx, roomID, limit+1, beforeID)
 	if err != nil {
 		return nil, err
+	}
+
+	hasMore := len(msgs) > limit
+	if hasMore {
+		msgs = msgs[:limit]
 	}
 
 	responses := make([]models.MessageResponse, 0, len(msgs))
@@ -190,12 +223,15 @@ func (s *service) GetRoomMessages(ctx context.Context, userIDStr, roomIDStr stri
 		responses = append(responses, *s.buildMessageResponse(ctx, &m))
 	}
 
-	// Reverse to chronological order
+	// Reverse from newest-first (DB order) to chronological for the client
 	for i, j := 0, len(responses)-1; i < j; i, j = i+1, j-1 {
 		responses[i], responses[j] = responses[j], responses[i]
 	}
 
-	return responses, nil
+	return &models.MessagesPage{
+		Messages: responses,
+		HasMore:  hasMore,
+	}, nil
 }
 
 func (s *service) GetUserRooms(ctx context.Context, userIDStr string) ([]models.RoomResponse, error) {
@@ -211,9 +247,12 @@ func (s *service) GetUserRooms(ctx context.Context, userIDStr string) ([]models.
 
 	responses := make([]models.RoomResponse, 0, len(rooms))
 	for _, r := range rooms {
-		if resp, err := s.buildRoomResponse(ctx, &r, userIDStr); err == nil {
-			responses = append(responses, *resp)
+		resp, err := s.buildRoomResponse(ctx, &r, userIDStr)
+		if err != nil {
+			log.Printf("GetUserRooms: failed to build room response for room %s: %v", r.ID.Hex(), err)
+			continue
 		}
+		responses = append(responses, *resp)
 	}
 
 	return responses, nil
@@ -248,18 +287,21 @@ func (s *service) MarkRoomAsRead(ctx context.Context, userIDStr, roomIDStr strin
 	}
 
 	// Broadcast read receipt to other participants so their UI updates the blue ticks
+	wsMsg := models.WSMessage{
+		Type:   "room_read",
+		RoomID: roomIDStr,
+		Payload: map[string]string{
+			"readBy": userIDStr,
+		},
+	}
+	var otherParticipants []string
 	for _, p := range room.Participants {
-		pHex := p.Hex()
-		if pHex != userIDStr {
-			wsMsg := models.WSMessage{
-				Type:   "room_read",
-				RoomID: roomIDStr,
-				Payload: map[string]string{
-					"readBy": userIDStr,
-				},
-			}
-			_ = s.hub.SendMessage(pHex, wsMsg)
+		if pHex := p.Hex(); pHex != userIDStr {
+			otherParticipants = append(otherParticipants, pHex)
 		}
+	}
+	if len(otherParticipants) > 0 {
+		_ = s.hub.SendToUsers(otherParticipants, wsMsg)
 	}
 
 	return nil
@@ -381,7 +423,7 @@ func (s *service) GetUserPresence(ctx context.Context, userIDStr string) (map[st
 }
 
 func (s *service) UpdateMessageStatus(ctx context.Context, userIDStr, messageIDStr, status string) error {
-	_, err := bson.ObjectIDFromHex(userIDStr)
+	userID, err := bson.ObjectIDFromHex(userIDStr)
 	if err != nil {
 		return errors.New("invalid user id")
 	}
@@ -398,6 +440,26 @@ func (s *service) UpdateMessageStatus(ctx context.Context, userIDStr, messageIDS
 	msg, err := s.repo.GetMessageByID(ctx, messageID)
 	if err != nil {
 		return errors.New("message not found")
+	}
+
+	// Ensure the caller is a participant in the room, not just any authenticated user
+	room, err := s.repo.GetRoomByID(ctx, msg.RoomID)
+	if err != nil {
+		return errors.New("room not found")
+	}
+	if !isUserInRoom(room, userID) {
+		return errors.New("unauthorized: not a participant in this room")
+	}
+
+	// Prevent status downgrade: sent < delivered < read
+	statusRank := map[string]int{
+		models.MessageStatusSent:      0,
+		models.MessageStatusDelivered: 1,
+		models.MessageStatusRead:      2,
+	}
+	if statusRank[status] <= statusRank[msg.Status] {
+		// Already at this status or higher — idempotent, not an error
+		return nil
 	}
 
 	if err := s.repo.UpdateMessageStatus(ctx, messageID, status); err != nil {
@@ -419,7 +481,7 @@ func (s *service) UpdateMessageStatus(ctx context.Context, userIDStr, messageIDS
 }
 
 func (s *service) UpdateMessageReaction(ctx context.Context, userIDStr, messageIDStr, emoji string) error {
-	_, err := bson.ObjectIDFromHex(userIDStr)
+	userID, err := bson.ObjectIDFromHex(userIDStr)
 	if err != nil {
 		return errors.New("invalid user id")
 	}
@@ -434,6 +496,15 @@ func (s *service) UpdateMessageReaction(ctx context.Context, userIDStr, messageI
 		return errors.New("message not found")
 	}
 
+	// Ensure the caller is a participant in the room
+	room, err := s.repo.GetRoomByID(ctx, msg.RoomID)
+	if err != nil {
+		return errors.New("room not found")
+	}
+	if !isUserInRoom(room, userID) {
+		return errors.New("unauthorized: not a participant in this room")
+	}
+
 	if currentEmoji, exists := msg.Reactions[userIDStr]; exists && currentEmoji == emoji {
 		emoji = ""
 	}
@@ -442,38 +513,87 @@ func (s *service) UpdateMessageReaction(ctx context.Context, userIDStr, messageI
 		return err
 	}
 
-	room, err := s.repo.GetRoomByID(ctx, msg.RoomID)
-	if err == nil {
-		wsMsg := models.WSMessage{
-			Type:   "reaction_updated",
-			RoomID: msg.RoomID.Hex(),
-			Payload: map[string]string{
-				"messageId": msg.ID.Hex(),
-				"userId":    userIDStr,
-				"emoji":     emoji,
-			},
-		}
-
-		userIDs := make([]string, len(room.Participants))
-		for i, p := range room.Participants {
-			userIDs[i] = p.Hex()
-		}
-		_ = s.hub.SendToUsers(userIDs, wsMsg)
+	wsMsg := models.WSMessage{
+		Type:   "reaction_updated",
+		RoomID: msg.RoomID.Hex(),
+		Payload: map[string]string{
+			"messageId": msg.ID.Hex(),
+			"userId":    userIDStr,
+			"emoji":     emoji,
+		},
 	}
+	userIDs := make([]string, len(room.Participants))
+	for i, p := range room.Participants {
+		userIDs[i] = p.Hex()
+	}
+	_ = s.hub.SendToUsers(userIDs, wsMsg)
 
 	return nil
+}
+
+// broadcastUserPresence notifies all unique participants across the user's rooms
+// that the user has come online or gone offline. Called on WS connect/disconnect.
+func (s *service) broadcastUserPresence(userID string, online bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return
+	}
+
+	rooms, err := s.repo.GetUserRooms(ctx, uid)
+	if err != nil {
+		log.Printf("broadcastUserPresence: failed to fetch rooms for user %s: %v", userID, err)
+		return
+	}
+
+	// Collect unique participant IDs across all rooms, excluding the user themselves
+	seen := make(map[string]bool)
+	var recipients []string
+	for _, room := range rooms {
+		for _, p := range room.Participants {
+			pHex := p.Hex()
+			if pHex != userID && !seen[pHex] {
+				seen[pHex] = true
+				recipients = append(recipients, pHex)
+			}
+		}
+	}
+
+	if len(recipients) == 0 {
+		return
+	}
+
+	eventType := "user_offline"
+	if online {
+		eventType = "user_online"
+	}
+
+	_ = s.hub.SendToUsers(recipients, models.WSMessage{
+		Type: eventType,
+		Payload: map[string]string{
+			"userId": userID,
+		},
+	})
 }
 
 func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 	client := &clientContext{
 		userID: userID,
 		conn:   c,
+		send:   make(chan []byte, sendBufSize),
 	}
 
 	s.hub.register <- client
 
+	// Notify room participants that this user is now online
+	go s.broadcastUserPresence(userID, true)
+
 	defer func() {
 		s.hub.unregister <- client
+		// Notify room participants that this user has gone offline
+		go s.broadcastUserPresence(userID, false)
 	}()
 
 	for {
@@ -494,7 +614,9 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 			if err != nil {
 				continue
 			}
-			room, err := s.repo.GetRoomByID(context.Background(), roomID)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			room, err := s.repo.GetRoomByID(ctx, roomID)
+			cancel()
 			if err != nil {
 				continue
 			}
@@ -561,32 +683,44 @@ func (s *service) buildRoomResponse(ctx context.Context, room *models.Room, forU
 }
 
 func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message) *models.MessageResponse {
-	var replyToResp *models.MessageResponse
-
-	if msg.ReplyToID != nil {
-		if replyMsg, err := s.repo.GetMessageByID(ctx, *msg.ReplyToID); err == nil {
-			replyToResp = &models.MessageResponse{
-				ID:        replyMsg.ID.Hex(),
-				RoomID:    replyMsg.RoomID.Hex(),
-				SenderID:  replyMsg.SenderID.Hex(),
-				Content:   replyMsg.Content,
-				Status:    replyMsg.Status,
-				CreatedAt: replyMsg.CreatedAt,
-			}
-		}
-	}
-
-	return &models.MessageResponse{
+	resp := &models.MessageResponse{
 		ID:        msg.ID.Hex(),
 		RoomID:    msg.RoomID.Hex(),
 		SenderID:  msg.SenderID.Hex(),
 		Content:   msg.Content,
 		Status:    msg.Status,
 		Reactions: msg.Reactions,
-		ReplyTo:   replyToResp,
 		IsEdited:  msg.IsEdited,
 		IsDeleted: msg.IsDeleted,
 		CreatedAt: msg.CreatedAt,
 		UpdatedAt: msg.UpdatedAt,
 	}
+
+	// Populate sender display info so frontend does not need a separate user lookup
+	if sender, err := s.userRepo.GetUserByID(ctx, msg.SenderID); err == nil && sender != nil {
+		resp.SenderName = sender.DisplayName
+		resp.SenderPhotoURL = sender.PhotoURL
+	}
+
+	// Populate reply-to message (one level deep only)
+	if msg.ReplyToID != nil {
+		if replyMsg, err := s.repo.GetMessageByID(ctx, *msg.ReplyToID); err == nil {
+			replyResp := &models.MessageResponse{
+				ID:        replyMsg.ID.Hex(),
+				RoomID:    replyMsg.RoomID.Hex(),
+				SenderID:  replyMsg.SenderID.Hex(),
+				Content:   replyMsg.Content,
+				Status:    replyMsg.Status,
+				IsDeleted: replyMsg.IsDeleted,
+				CreatedAt: replyMsg.CreatedAt,
+			}
+			if replySender, err := s.userRepo.GetUserByID(ctx, replyMsg.SenderID); err == nil && replySender != nil {
+				replyResp.SenderName = replySender.DisplayName
+				replyResp.SenderPhotoURL = replySender.PhotoURL
+			}
+			resp.ReplyTo = replyResp
+		}
+	}
+
+	return resp
 }

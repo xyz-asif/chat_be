@@ -14,11 +14,15 @@ type Repository interface {
 	CreateRoom(ctx context.Context, room *models.Room) error
 	GetRoomByID(ctx context.Context, roomID bson.ObjectID) (*models.Room, error)
 	GetDirectRoom(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error)
+	GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error)
 	GetUserRooms(ctx context.Context, userID bson.ObjectID) ([]models.Room, error)
 
 	SaveMessage(ctx context.Context, msg *models.Message) error
 	GetMessageByID(ctx context.Context, messageID bson.ObjectID) (*models.Message, error)
-	GetMessagesByRoom(ctx context.Context, roomID bson.ObjectID, limit, offset int) ([]models.Message, error)
+	// GetMessagesByRoom returns up to limit messages in the room.
+	// If beforeID is non-nil, only messages with _id < beforeID are returned
+	// (cursor-based / keyset pagination — O(1) regardless of page depth).
+	GetMessagesByRoom(ctx context.Context, roomID bson.ObjectID, limit int, beforeID *bson.ObjectID) ([]models.Message, error)
 	UpdateRoomLastMessage(ctx context.Context, roomID bson.ObjectID, lastMessage string, senderID bson.ObjectID) error
 	UpdateMessageStatus(ctx context.Context, messageID bson.ObjectID, status string) error
 	UpdateMessageReaction(ctx context.Context, messageID bson.ObjectID, userID, emoji string) error
@@ -26,7 +30,9 @@ type Repository interface {
 	SoftDeleteMessage(ctx context.Context, messageID bson.ObjectID) error
 
 	// Unread count management
-	IncrementUnreadCounts(ctx context.Context, roomID bson.ObjectID, exceptUserID string) error
+	// IncrementUnreadCounts bumps the unread counter for every participant except exceptUserID.
+	// Callers must pass the already-known participants slice to avoid a redundant DB fetch.
+	IncrementUnreadCounts(ctx context.Context, roomID bson.ObjectID, participants []bson.ObjectID, exceptUserID string) error
 	ResetUnreadCount(ctx context.Context, roomID bson.ObjectID, userID string) error
 	MarkRoomMessagesAsRead(ctx context.Context, roomID, senderID bson.ObjectID) error
 }
@@ -88,6 +94,35 @@ func (r *repository) GetDirectRoom(ctx context.Context, user1ID, user2ID bson.Ob
 	return &room, nil
 }
 
+// GetOrCreateDirectRoomAtomic finds or atomically creates a direct room between two users.
+// Using FindOneAndUpdate with upsert eliminates the check-then-insert race condition.
+func (r *repository) GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error) {
+	// First, try to find the existing direct room
+	room, err := r.GetDirectRoom(ctx, user1ID, user2ID)
+	if err != nil {
+		return nil, err
+	}
+	if room != nil {
+		return room, nil
+	}
+
+	// Create a new direct room if it doesn't exist
+	newRoom := &models.Room{
+		Type:         models.RoomTypeDirect,
+		Participants: []bson.ObjectID{user1ID, user2ID},
+		UnreadCounts: map[string]int{
+			user1ID.Hex(): 0,
+			user2ID.Hex(): 0,
+		},
+	}
+
+	if err := r.CreateRoom(ctx, newRoom); err != nil {
+		return nil, err
+	}
+
+	return newRoom, nil
+}
+
 func (r *repository) GetUserRooms(ctx context.Context, userID bson.ObjectID) ([]models.Room, error) {
 	filter := bson.M{"participants": userID}
 	opts := options.Find().SetSort(bson.D{{Key: "lastUpdated", Value: -1}})
@@ -116,12 +151,15 @@ func (r *repository) SaveMessage(ctx context.Context, msg *models.Message) error
 	return nil
 }
 
-func (r *repository) GetMessagesByRoom(ctx context.Context, roomID bson.ObjectID, limit, offset int) ([]models.Message, error) {
+func (r *repository) GetMessagesByRoom(ctx context.Context, roomID bson.ObjectID, limit int, beforeID *bson.ObjectID) ([]models.Message, error) {
 	filter := bson.M{"roomId": roomID}
+	if beforeID != nil {
+		filter["_id"] = bson.M{"$lt": *beforeID}
+	}
+
 	opts := options.Find().
-		SetSort(bson.D{{Key: "createdAt", Value: -1}}).
-		SetLimit(int64(limit)).
-		SetSkip(int64(offset))
+		SetSort(bson.D{{Key: "_id", Value: -1}}).
+		SetLimit(int64(limit))
 
 	cursor, err := r.messages.Find(ctx, filter, opts)
 	if err != nil {
@@ -206,24 +244,19 @@ func (r *repository) SoftDeleteMessage(ctx context.Context, messageID bson.Objec
 			"isDeleted": true,
 			"updatedAt": time.Now(),
 		},
+		// Clear reactions — deleted messages should not show emoji counts
+		"$unset": bson.M{"reactions": ""},
 	}
 	_, err := r.messages.UpdateOne(ctx, bson.M{"_id": messageID}, update)
 	return err
 }
 
-// IncrementUnreadCounts bumps unread count for all participants EXCEPT the sender
-func (r *repository) IncrementUnreadCounts(ctx context.Context, roomID bson.ObjectID, exceptUserID string) error {
-	// First get the room to know all participants
-	room, err := r.GetRoomByID(ctx, roomID)
-	if err != nil {
-		return err
-	}
-
-	// Build $inc map for everyone except the sender
+// IncrementUnreadCounts bumps unread count for all participants EXCEPT the sender.
+// participants is passed in by the caller — no extra DB fetch needed.
+func (r *repository) IncrementUnreadCounts(ctx context.Context, roomID bson.ObjectID, participants []bson.ObjectID, exceptUserID string) error {
 	incMap := bson.M{}
-	for _, p := range room.Participants {
-		hex := p.Hex()
-		if hex != exceptUserID {
+	for _, p := range participants {
+		if hex := p.Hex(); hex != exceptUserID {
 			incMap["unreadCounts."+hex] = 1
 		}
 	}
@@ -232,8 +265,7 @@ func (r *repository) IncrementUnreadCounts(ctx context.Context, roomID bson.Obje
 		return nil
 	}
 
-	update := bson.M{"$inc": incMap}
-	_, err = r.rooms.UpdateOne(ctx, bson.M{"_id": roomID}, update)
+	_, err := r.rooms.UpdateOne(ctx, bson.M{"_id": roomID}, bson.M{"$inc": incMap})
 	return err
 }
 

@@ -70,17 +70,27 @@ type Message struct {
 
 // MessageResponse is used to send formatted message objects to clients
 type MessageResponse struct {
-	ID        string            `json:"id"`
-	RoomID    string            `json:"roomId"`
-	SenderID  string            `json:"senderId"`
-	Content   string            `json:"content"`
-	Status    string            `json:"status"`
-	Reactions map[string]string `json:"reactions,omitempty"`
-	ReplyTo   *MessageResponse  `json:"replyTo,omitempty"` // Optional nested reply
-	IsEdited  bool              `json:"isEdited,omitempty"`
-	IsDeleted bool              `json:"isDeleted,omitempty"`
-	CreatedAt time.Time         `json:"createdAt"`
-	UpdatedAt time.Time         `json:"updatedAt,omitempty"`
+	ID               string            `json:"id"`
+	RoomID           string            `json:"roomId"`
+	SenderID         string            `json:"senderId"`
+	SenderName       string            `json:"senderName,omitempty"`
+	SenderPhotoURL   string            `json:"senderPhotoURL,omitempty"`
+	Content          string            `json:"content"`
+	Status           string            `json:"status"`
+	Reactions        map[string]string `json:"reactions,omitempty"`
+	ReplyTo          *MessageResponse  `json:"replyTo,omitempty"` // Optional nested reply
+	IsEdited         bool              `json:"isEdited,omitempty"`
+	IsDeleted        bool              `json:"isDeleted,omitempty"`
+	CreatedAt        time.Time         `json:"createdAt"`
+	UpdatedAt        time.Time         `json:"updatedAt,omitempty"`
+}
+
+// MessagesPage is the paginated response for GetRoomMessages.
+// Cursor-based: pass the ID of the oldest message in the current page
+// as the next request's `before` parameter to load the previous page.
+type MessagesPage struct {
+	Messages []MessageResponse `json:"messages"`
+	HasMore  bool              `json:"hasMore"`
 }
 
 // WSMessage represents the payload sent/received over the WebSocket connection

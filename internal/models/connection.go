@@ -16,12 +16,18 @@ const (
 
 // Connection represents a relationship or chat request between two users
 type Connection struct {
-	ID         bson.ObjectID `bson:"_id,omitempty" json:"id"`
-	SenderID   bson.ObjectID `bson:"senderId" json:"senderId"`
-	ReceiverID bson.ObjectID `bson:"receiverId" json:"receiverId"`
-	Status     string        `bson:"status" json:"status"` // pending, accepted, rejected, blocked
-	CreatedAt  time.Time     `bson:"createdAt" json:"createdAt"`
-	UpdatedAt  time.Time     `bson:"updatedAt" json:"updatedAt"`
+	ID                  bson.ObjectID `bson:"_id,omitempty" json:"id"`
+	SenderID            bson.ObjectID `bson:"senderId" json:"senderId"`
+	ReceiverID          bson.ObjectID `bson:"receiverId" json:"receiverId"`
+	Status              string        `bson:"status" json:"status"` // pending, accepted, rejected, blocked
+	SenderDisplayName   string        `bson:"-" json:"senderDisplayName,omitempty"`
+	SenderEmail         string        `bson:"-" json:"senderEmail,omitempty"`
+	SenderPhotoURL      string        `bson:"-" json:"senderPhotoUrl,omitempty"`
+	ReceiverDisplayName string        `bson:"-" json:"receiverDisplayName,omitempty"`
+	ReceiverEmail       string        `bson:"-" json:"receiverEmail,omitempty"`
+	ReceiverPhotoURL    string        `bson:"-" json:"receiverPhotoUrl,omitempty"`
+	CreatedAt           time.Time     `bson:"createdAt" json:"createdAt"`
+	UpdatedAt           time.Time     `bson:"updatedAt" json:"updatedAt"`
 }
 
 // ConnectionResponse is used for sending connection data with user details to the frontend

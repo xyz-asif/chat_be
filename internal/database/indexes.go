@@ -58,8 +58,10 @@ func CreateIndexes(ctx context.Context, db *mongo.Database) error {
 
 	// ── Chat Messages ──
 	messagesIndexes := []mongo.IndexModel{
-		// Fast lookup: messages in a room sorted by time (the primary query)
-		{Keys: bson.D{{Key: "roomId", Value: 1}, {Key: "createdAt", Value: -1}}},
+		// Primary query: cursor-based pagination uses _id as cursor (ObjectID is monotonic)
+		{Keys: bson.D{{Key: "roomId", Value: 1}, {Key: "_id", Value: -1}}},
+		// Bulk read-status update: MarkRoomMessagesAsRead filters by roomId + senderId + status
+		{Keys: bson.D{{Key: "roomId", Value: 1}, {Key: "senderId", Value: 1}, {Key: "status", Value: 1}}},
 	}
 	if _, err := db.Collection("chat_messages").Indexes().CreateMany(ctx, messagesIndexes); err != nil {
 		log.Printf("Warning: Chat messages index creation issue: %v", err)

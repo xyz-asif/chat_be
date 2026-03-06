@@ -16,6 +16,7 @@
 8. [Presence Endpoint](#8-presence-endpoint)
 9. [WebSocket — Real-time Events](#9-websocket--real-time-events)
 10. [Error Handling](#10-error-handling)
+11. [Quick Reference](#11-quick-reference--all-endpoints)
 
 ---
 
@@ -112,7 +113,7 @@ The backend verifies this token against Firebase and extracts the user. **No sep
 ```
 
 > **For unread badge:** Use `unreadCount` from this object.
-> **For online green dot:** Check `participants[i].isOnline`.
+> **For online green dot:** Check `participants[i].isOnline`. This is the at-load-time value. For live updates, listen for `user_online` / `user_offline` WebSocket events.
 
 ### MessageResponse
 ```json
@@ -120,14 +121,18 @@ The backend verifies this token against Firebase and extracts the user. **No sep
   "id": "63f1a2b3c4d5e6f7a8b9c0d2",
   "roomId": "63f1a2b3c4d5e6f7a8b9c0d1",
   "senderId": "507f1f77bcf86cd799439011",
+  "senderName": "Alice Smith",
+  "senderPhotoURL": "https://example.com/avatar.jpg",
   "content": "Hello!",
-  "status": "read",
+  "status": "delivered",
   "reactions": {
     "507f1f77bcf86cd799439012": "👍"
   },
   "replyTo": {
     "id": "63f1a2b3c4d5e6f7a8b9c0d0",
     "senderId": "507f1f77bcf86cd799439012",
+    "senderName": "Bob Jones",
+    "senderPhotoURL": "https://example.com/bob.jpg",
     "content": "Are you there?",
     "status": "read",
     "createdAt": "2026-03-05T13:55:00Z"
@@ -139,10 +144,26 @@ The backend verifies this token against Firebase and extracts the user. **No sep
 }
 ```
 
-> **Message status values:** `"sent"` → `"delivered"` → `"read"` (Blue ticks)
-> **`replyTo`** is `null` unless the message is a reply.
-> **`reactions`** is a map of `userId → emoji`. Empty object `{}` means no reactions.
+> **Message status values:** `"sent"` → `"delivered"` → `"read"` (one-way only — status never goes backwards)
+> - `"sent"` — saved on server, recipient offline at time of sending (single grey tick)
+> - `"delivered"` — recipient was online when the message was sent (double grey tick). **Set automatically by the backend — no frontend action required.**
+> - `"read"` — recipient called `POST /rooms/:roomId/read` (double blue tick)
+>
+> **`senderName` / `senderPhotoURL`** — included on every message so the frontend never needs a separate user lookup to render the message bubble.
+> **`replyTo`** is `null` unless the message is a reply. One level deep only.
+> **`reactions`** is a map of `userId → emoji`. Omitted when empty. On a deleted message, reactions are always cleared.
 > **`isDeleted: true`** means content is `"This message was deleted"` — render greyed out italicised text.
+
+### MessagesPage (response for message history)
+```json
+{
+  "messages": [ MessageResponse, MessageResponse, "..." ],
+  "hasMore": true
+}
+```
+
+> **`messages`** is in chronological (oldest-first) order.
+> **`hasMore`** — if `true`, there are older messages to load. Pass the `id` of the first (oldest) message in the current list as the `before` param to fetch the previous page.
 
 ### Connection
 ```json
@@ -176,7 +197,7 @@ Update profile fields. Send only the fields you want to change.
 {
   "displayName": "Alice Smith",
   "photoURL": "https://storage.googleapis.com/my-bucket/avatar.jpg",
-  "bio": "Living life 🚀"
+  "bio": "Living life"
 }
 ```
 
@@ -263,7 +284,7 @@ Update profile fields. Send only the fields you want to change.
 
 `:id` is the **target user's ID**.
 
-> ⚠️ **You must be friends (accepted connection) with the user to create a room.** Returns `400` otherwise.
+> You must be friends (accepted connection) with the user to create a room. Returns `400` otherwise.
 
 **Request Body:** None
 
@@ -280,27 +301,41 @@ Returns all rooms the authenticated user is part of, sorted by `lastUpdated` (ne
 **Response `data`:** Array of `RoomResponse` objects
 
 > This is the data for your main chat list screen. Each room contains `unreadCount` and `participants[i].isOnline`.
+>
+> **Live re-ordering:** Listen for the `room_updated` WebSocket event. When received, move that room to the top of the list and update its `lastMessage` preview — no re-fetch needed.
 
 ---
 
-### `GET /chat/rooms/:roomId/messages?limit=50&offset=0` — Get Message History
+### `GET /chat/rooms/:roomId/messages` — Get Message History
+
+Cursor-based pagination. Returns messages in **chronological (oldest-first)** order.
 
 **Query Params:**
 
-| Param | Type | Default | Max |
-|---|---|---|---|
-| `limit` | `int` | 50 | 200 |
-| `offset` | `int` | 0 | — |
+| Param | Type | Default | Max | Description |
+|---|---|---|---|---|
+| `limit` | `int` | 50 | 100 | Number of messages per page |
+| `before` | `string` | — | — | Message ID cursor. Returns messages older than this ID. |
 
-**Response `data`:** Array of `MessageResponse` objects, in **oldest-first** (chronological) order.
+**Response `data`:** `MessagesPage` object
 
-> **Pagination:** To load older messages, increment `offset`. E.g., first load: `offset=0`, next page: `offset=50`.
+**Pagination flow:**
+1. **First load** — call with no `before` param. Gets the latest `limit` messages.
+2. **Load older messages** — pass the `id` of the **oldest (first) message** currently displayed as `before`.
+3. **Stop** when `hasMore` is `false`.
+
+```
+First page:  GET /chat/rooms/:roomId/messages?limit=50
+Older page:  GET /chat/rooms/:roomId/messages?limit=50&before=63f1a2b3c4d5e6f7a8b9c0d2
+```
+
+> The `before` cursor is stable — inserting new messages never shifts old pages.
 
 ---
 
 ### `POST /chat/rooms/:roomId/read` — Mark Room as Read
 
-Call this immediately when the user **opens** a chat room. Resets the unread count to 0 and marks all unread messages as "read". Also broadcasts `room_read` via WebSocket to the other participant to update their blue ticks.
+Call this immediately when the user **opens** a chat room. Resets the unread count to 0 and marks all unread messages as `"read"`. Also broadcasts `room_read` via WebSocket to the other participant to trigger blue ticks on their end.
 
 **Request Body:** None
 
@@ -322,18 +357,22 @@ Call this immediately when the user **opens** a chat room. Resets the unread cou
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `content` | `string` | ✅ Yes | Message text |
-| `replyToId` | `string` | ❌ No | ID of the message being replied to |
+| `content` | `string` | Yes | Message text. Max 2000 characters. |
+| `replyToId` | `string` | No | ID of the message being replied to |
 
 **Response `data`:** `MessageResponse` object (HTTP 201)
 
-> After sending, a **WebSocket `message` event** is broadcast to all participants in the room. Build your UI to append messages received via WS rather than polling.
+> **Status on send:** If the recipient is online at the moment of sending, the message is automatically saved as `"delivered"` — you will see `status: "delivered"` in both the HTTP response and the WS broadcast. If the recipient is offline, it will be `"sent"`.
+>
+> After sending, two **WebSocket events** are broadcast to all participants:
+> - `message` — the new message itself
+> - `room_updated` — signals the chat list to re-order
 
 ---
 
-### `PATCH /chat/messages/:messageId/status` — Update Message Status (Blue Ticks)
+### `PATCH /chat/messages/:messageId/status` — Update Message Status
 
-Call this to mark a message as `"delivered"` or `"read"`.
+Call this to manually mark a message as `"read"`. The `"delivered"` status is now handled automatically by the backend when a message is sent to an online user — **you no longer need to call this for delivered**.
 
 **Request Body:**
 ```json
@@ -344,9 +383,11 @@ Call this to mark a message as `"delivered"` or `"read"`.
 
 | Status | Meaning |
 |---|---|
-| `"delivered"` | Message received on device (grey double tick) |
-| `"read"` | Message opened by user (blue double tick) |
+| `"delivered"` | Message received on device (double grey tick) — handled automatically, only call manually if needed |
+| `"read"` | Message opened by user (double blue tick) |
 
+> Prefer using `POST /rooms/:roomId/read` to bulk-mark all messages as read when a room is opened. Use this endpoint only to mark individual messages.
+>
 > The sender automatically receives a **WebSocket `message_status_changed` event**.
 
 ---
@@ -406,7 +447,7 @@ Only the sender can delete their own message. This is a **soft delete** — the 
 }
 ```
 
-> **Flutter Tip:** You don't need to call this for the chat list — online status is already embedded in `RoomResponse.participants[i].isOnline`. Use this endpoint only when you want to check a specific user's status on-demand (e.g., on a profile page).
+> **Flutter Tip:** Use this only for on-demand checks (e.g. a profile page). For the chat list, online status is embedded in `RoomResponse.participants[i].isOnline` at load time. For live updates, listen for `user_online` / `user_offline` WebSocket events — **do not poll this endpoint on a timer**.
 
 ---
 
@@ -439,6 +480,8 @@ All messages (sent and received) use this JSON envelope:
 }
 ```
 
+`roomId` is omitted for events that are not room-specific (e.g. `user_online`).
+
 ---
 
 ### Events You RECEIVE from the Server
@@ -451,7 +494,49 @@ All messages (sent and received) use this JSON envelope:
   "payload": { /* Full MessageResponse object */ }
 }
 ```
-> Append this to the message list for the matching `roomId`. Also update the `lastMessage` preview in the chat list and move that room to the top.
+> Append to the message list for the matching `roomId`. The `status` field in the payload is already correct (`"sent"` or `"delivered"`).
+
+---
+
+#### `room_updated` — Chat list needs re-ordering
+```json
+{
+  "type": "room_updated",
+  "roomId": "63f1...",
+  "payload": {
+    "lastMessage": "Hey!",
+    "lastUpdated": "2026-03-06T10:00:00Z",
+    "lastSenderId": "507f..."
+  }
+}
+```
+> Move the room matching `roomId` to the top of the chat list. Update its last message preview with `lastMessage`. **This fires on every new message — use it instead of re-fetching the room list.**
+
+---
+
+#### `user_online` — A contact came online
+```json
+{
+  "type": "user_online",
+  "payload": {
+    "userId": "507f..."
+  }
+}
+```
+> Show the green online dot next to this user in the chat list and chat screen. Only sent to users who share a chat room with the user who connected.
+
+---
+
+#### `user_offline` — A contact went offline
+```json
+{
+  "type": "user_offline",
+  "payload": {
+    "userId": "507f..."
+  }
+}
+```
+> Remove the green online dot for this user. Only sent to users who share a chat room with the user who disconnected.
 
 ---
 
@@ -467,7 +552,21 @@ All messages (sent and received) use this JSON envelope:
   }
 }
 ```
-> Find the message by `messageId` and update its `status`. Used to show grey → blue ticks.
+> Find the message by `messageId` and update its `status`. Used to show grey → blue ticks on individual messages.
+
+---
+
+#### `room_read` — Another participant read the entire room
+```json
+{
+  "type": "room_read",
+  "roomId": "63f1...",
+  "payload": {
+    "readBy": "507f..."
+  }
+}
+```
+> Update **all** your sent messages in `roomId` to `status: "read"` (blue ticks). This fires when the other user opens the chat room.
 
 ---
 
@@ -483,7 +582,7 @@ All messages (sent and received) use this JSON envelope:
   }
 }
 ```
-> If `emoji` is an **empty string `""`**, remove that user's reaction from the message. Otherwise, update/add it.
+> If `emoji` is an **empty string `""`**, remove that user's reaction from the message. Otherwise, set `reactions[userId] = emoji`.
 
 ---
 
@@ -516,20 +615,6 @@ All messages (sent and received) use this JSON envelope:
 
 ---
 
-#### `room_read` — Another participant read the room (batch read receipt)
-```json
-{
-  "type": "room_read",
-  "roomId": "63f1...",
-  "payload": {
-    "readBy": "507f..."
-  }
-}
-```
-> Update all your sent messages in `roomId` to `status: "read"` (blue ticks).
-
----
-
 #### `typing_start` — A user started typing
 ```json
 {
@@ -540,7 +625,7 @@ All messages (sent and received) use this JSON envelope:
   }
 }
 ```
-> Show "Alice is typing..." indicator in the chat.
+> Show "Alice is typing..." indicator in the chat screen.
 
 ---
 
@@ -560,6 +645,8 @@ All messages (sent and received) use this JSON envelope:
 
 ### Events You SEND to the Server
 
+Only typing events need to be sent from the client. All other state changes go through REST endpoints.
+
 #### Typing Started
 ```json
 {
@@ -576,7 +663,25 @@ All messages (sent and received) use this JSON envelope:
 }
 ```
 
-> Send `typing_start` when the user begins typing in a text field, and `typing_stop` when they stop (use a debounce timer of ~1-2 seconds).
+> Send `typing_start` when the user begins typing in a text field, and `typing_stop` when they stop (use a debounce timer of ~1-2 seconds of inactivity).
+
+---
+
+### Full WebSocket Event Summary
+
+| Event `type` | Direction | Trigger |
+|---|---|---|
+| `message` | Server → Client | New message sent in a room |
+| `room_updated` | Server → Client | New message sent — update chat list order |
+| `user_online` | Server → Client | A contact's WebSocket connected |
+| `user_offline` | Server → Client | A contact's WebSocket disconnected |
+| `message_status_changed` | Server → Client | Individual message status updated |
+| `room_read` | Server → Client | Another participant read the whole room |
+| `reaction_updated` | Server → Client | Emoji added or removed on a message |
+| `message_edited` | Server → Client | Message content changed |
+| `message_deleted` | Server → Client | Message soft-deleted |
+| `typing_start` | Client → Server → Client | User started typing |
+| `typing_stop` | Client → Server → Client | User stopped typing |
 
 ---
 
@@ -605,27 +710,27 @@ For all errors, the response body is:
 
 ---
 
-## Quick Reference — All Endpoints
+## 11. Quick Reference — All Endpoints
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/users/me` | ✅ | Get my profile |
-| `PATCH` | `/users/me` | ✅ | Update my profile |
-| `GET` | `/users/search?q=` | ✅ | Search users |
-| `POST` | `/connections/request` | ✅ | Send friend request |
-| `POST` | `/connections/:id/accept` | ✅ | Accept friend request |
-| `POST` | `/connections/:id/reject` | ✅ | Reject friend request |
-| `GET` | `/connections/pending` | ✅ | Get pending requests |
-| `GET` | `/connections/friends` | ✅ | Get friends list |
-| `GET` | `/chat/rooms` | ✅ | Get chat list |
-| `POST` | `/chat/rooms/direct/:id` | ✅ | Open/create chat with user |
-| `GET` | `/chat/rooms/:roomId/messages` | ✅ | Get message history |
-| `POST` | `/chat/rooms/:roomId/messages` | ✅ | Send a message |
-| `POST` | `/chat/rooms/:roomId/read` | ✅ | Mark room as read |
-| `PATCH` | `/chat/messages/:messageId/status` | ✅ | Update message tick status |
-| `PUT` | `/chat/messages/:messageId/reactions` | ✅ | Add/remove emoji reaction |
-| `PATCH` | `/chat/messages/:messageId` | ✅ | Edit a message |
-| `DELETE` | `/chat/messages/:messageId` | ✅ | Delete a message |
-| `GET` | `/chat/users/:id/presence` | ✅ | Get user online status |
-| `WS` | `/chat/ws` | ✅ | WebSocket connection |
-| `GET` | `/health` | ❌ | Health check |
+| `GET` | `/users/me` | Yes | Get my profile |
+| `PATCH` | `/users/me` | Yes | Update my profile |
+| `GET` | `/users/search?q=` | Yes | Search users |
+| `POST` | `/connections/request` | Yes | Send friend request |
+| `POST` | `/connections/:id/accept` | Yes | Accept friend request |
+| `POST` | `/connections/:id/reject` | Yes | Reject friend request |
+| `GET` | `/connections/pending` | Yes | Get pending requests |
+| `GET` | `/connections/friends` | Yes | Get friends list |
+| `GET` | `/chat/rooms` | Yes | Get chat list |
+| `POST` | `/chat/rooms/direct/:id` | Yes | Open/create chat with user |
+| `GET` | `/chat/rooms/:roomId/messages?limit=50&before=<id>` | Yes | Get message history (cursor paginated) |
+| `POST` | `/chat/rooms/:roomId/messages` | Yes | Send a message |
+| `POST` | `/chat/rooms/:roomId/read` | Yes | Mark room as read (blue ticks) |
+| `PATCH` | `/chat/messages/:messageId/status` | Yes | Update individual message tick status |
+| `PUT` | `/chat/messages/:messageId/reactions` | Yes | Add/remove emoji reaction |
+| `PATCH` | `/chat/messages/:messageId` | Yes | Edit a message |
+| `DELETE` | `/chat/messages/:messageId` | Yes | Delete a message |
+| `GET` | `/chat/users/:id/presence` | Yes | Get user online status (on-demand) |
+| `WS` | `/chat/ws?token=<token>` | Yes | WebSocket connection |
+| `GET` | `/health` | No | Health check |

@@ -108,5 +108,37 @@ func (r *repository) GetUserConnections(ctx context.Context, userID bson.ObjectI
 		return nil, err
 	}
 
+	if len(connections) > 0 {
+		var userIDs []bson.ObjectID
+		for _, conn := range connections {
+			userIDs = append(userIDs, conn.SenderID, conn.ReceiverID)
+		}
+
+		usersColl := r.db.Collection("users")
+		usersCursor, err := usersColl.Find(ctx, bson.M{"_id": bson.M{"$in": userIDs}})
+		if err == nil {
+			var users []models.User
+			if err := usersCursor.All(ctx, &users); err == nil {
+				userMap := make(map[bson.ObjectID]models.User)
+				for _, u := range users {
+					userMap[u.ID] = u
+				}
+
+				for i, conn := range connections {
+					if sender, ok := userMap[conn.SenderID]; ok {
+						connections[i].SenderDisplayName = sender.DisplayName
+						connections[i].SenderEmail = sender.Email
+						connections[i].SenderPhotoURL = sender.PhotoURL
+					}
+					if receiver, ok := userMap[conn.ReceiverID]; ok {
+						connections[i].ReceiverDisplayName = receiver.DisplayName
+						connections[i].ReceiverEmail = receiver.Email
+						connections[i].ReceiverPhotoURL = receiver.PhotoURL
+					}
+				}
+			}
+		}
+	}
+
 	return connections, nil
 }

@@ -9,33 +9,53 @@ import (
 	"github.com/xyz-asif/gotodo/internal/models"
 )
 
+const sendBufSize = 256
+
 // Hub manages active WebSocket connections
 type Hub struct {
-	clients    map[string]map[*websocket.Conn]bool
+	clients    map[string]map[*clientContext]bool
 	clientsMu  sync.RWMutex
 	register   chan *clientContext
 	unregister chan *clientContext
 	broadcast  chan broadcastMessage
 }
 
+// clientContext holds one WebSocket connection and its dedicated send channel.
+// All writes go through the send channel so only one goroutine ever calls
+// WriteMessage on a given connection — eliminating concurrent-write panics.
 type clientContext struct {
 	userID string
 	conn   *websocket.Conn
-	mu     sync.Mutex // Per-connection write mutex to prevent concurrent writes
+	send   chan []byte
 }
 
 type broadcastMessage struct {
-	userIDs     []string // Send to multiple users at once
+	userIDs     []string
 	messageData []byte
 }
 
 // NewHub creates a new Hub instance with buffered channels for high throughput
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[string]map[*websocket.Conn]bool),
+		clients:    make(map[string]map[*clientContext]bool),
 		register:   make(chan *clientContext, 64),
 		unregister: make(chan *clientContext, 64),
 		broadcast:  make(chan broadcastMessage, 256),
+	}
+}
+
+// writePump is the sole goroutine allowed to write to a connection.
+// It drains the client's send channel until it is closed.
+func (h *Hub) writePump(client *clientContext) {
+	defer client.conn.Close()
+	for data := range client.send {
+		if err := client.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Printf("WS write error for user %s: %v", client.userID, err)
+			// Drain remaining messages so the channel can be GC'd
+			for range client.send {
+			}
+			return
+		}
 	}
 }
 
@@ -46,18 +66,20 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.clientsMu.Lock()
 			if h.clients[client.userID] == nil {
-				h.clients[client.userID] = make(map[*websocket.Conn]bool)
+				h.clients[client.userID] = make(map[*clientContext]bool)
 			}
-			h.clients[client.userID][client.conn] = true
+			h.clients[client.userID][client] = true
 			h.clientsMu.Unlock()
+			// Start the dedicated writer for this connection
+			go h.writePump(client)
 			log.Printf("User %s connected (total conns: %d)", client.userID, len(h.clients[client.userID]))
 
 		case client := <-h.unregister:
 			h.clientsMu.Lock()
 			if conns, ok := h.clients[client.userID]; ok {
-				if _, exists := conns[client.conn]; exists {
-					delete(conns, client.conn)
-					client.conn.Close()
+				if _, exists := conns[client]; exists {
+					delete(conns, client)
+					close(client.send) // signals writePump to exit
 					if len(conns) == 0 {
 						delete(h.clients, client.userID)
 					}
@@ -69,14 +91,12 @@ func (h *Hub) Run() {
 		case msg := <-h.broadcast:
 			h.clientsMu.RLock()
 			for _, uid := range msg.userIDs {
-				if conns, ok := h.clients[uid]; ok {
-					for conn := range conns {
-						// Fire-and-forget write in a goroutine to avoid blocking the hub loop
-						go func(c *websocket.Conn, data []byte) {
-							if err := c.WriteMessage(websocket.TextMessage, data); err != nil {
-								log.Printf("WS write error for user: %v", err)
-							}
-						}(conn, msg.messageData)
+				for client := range h.clients[uid] {
+					select {
+					case client.send <- msg.messageData:
+					default:
+						// Send buffer full — drop message to avoid blocking the hub
+						log.Printf("WS send buffer full for user %s, dropping message", uid)
 					}
 				}
 			}
@@ -85,16 +105,19 @@ func (h *Hub) Run() {
 	}
 }
 
-// SendToUsers sends a modeled websocket message to multiple users at once
+// SendToUsers sends a modeled websocket message to multiple users at once.
+// The send is non-blocking: if the broadcast channel is full the message is
+// dropped and an error is returned so callers are never hung.
 func (h *Hub) SendToUsers(userIDs []string, msg models.WSMessage) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	h.broadcast <- broadcastMessage{
-		userIDs:     userIDs,
-		messageData: data,
+	select {
+	case h.broadcast <- broadcastMessage{userIDs: userIDs, messageData: data}:
+	default:
+		log.Printf("WS broadcast channel full, dropping message type=%s", msg.Type)
 	}
 	return nil
 }

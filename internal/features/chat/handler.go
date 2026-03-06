@@ -76,7 +76,10 @@ func (h *Handler) GetUserRooms(c *fiber.Ctx) error {
 	return response.OK(c, "Rooms retrieved", rooms)
 }
 
-// GetRoomMessages HTTP Endpoint to fetch history
+// GetRoomMessages HTTP Endpoint to fetch history (cursor-based pagination)
+// Query params:
+//   - limit  int    (default 50, max 100)
+//   - before string message ID — return messages older than this ID
 func (h *Handler) GetRoomMessages(c *fiber.Ctx) error {
 	user, ok := c.Locals("user").(*models.User)
 	if !ok {
@@ -85,14 +88,14 @@ func (h *Handler) GetRoomMessages(c *fiber.Ctx) error {
 
 	roomID := c.Params("roomId")
 	limit := c.QueryInt("limit", 50)
-	offset := c.QueryInt("offset", 0)
+	before := c.Query("before") // cursor: ObjectID hex of the oldest message currently shown
 
-	msgs, err := h.service.GetRoomMessages(c.Context(), user.ID.Hex(), roomID, limit, offset)
+	page, err := h.service.GetRoomMessages(c.Context(), user.ID.Hex(), roomID, limit, before)
 	if err != nil {
 		return response.BadRequest(c, err.Error())
 	}
 
-	return response.OK(c, "Messages retrieved", msgs)
+	return response.OK(c, "Messages retrieved", page)
 }
 
 // SendMessage HTTP Endpoint
