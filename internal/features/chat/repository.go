@@ -23,7 +23,7 @@ type Repository interface {
 	// If beforeID is non-nil, only messages with _id < beforeID are returned
 	// (cursor-based / keyset pagination — O(1) regardless of page depth).
 	GetMessagesByRoom(ctx context.Context, roomID bson.ObjectID, limit int, beforeID *bson.ObjectID) ([]models.Message, error)
-	UpdateRoomLastMessage(ctx context.Context, roomID bson.ObjectID, lastMessage string, senderID bson.ObjectID) error
+	UpdateRoomLastMessage(ctx context.Context, roomID bson.ObjectID, lastMessage, lastMessageType string, senderID bson.ObjectID) error
 	UpdateMessageStatus(ctx context.Context, messageID bson.ObjectID, status string) error
 	UpdateMessageReaction(ctx context.Context, messageID bson.ObjectID, userID, emoji string) error
 	UpdateMessageContent(ctx context.Context, messageID bson.ObjectID, content string) error
@@ -175,10 +175,11 @@ func (r *repository) GetMessagesByRoom(ctx context.Context, roomID bson.ObjectID
 	return msgs, nil
 }
 
-func (r *repository) UpdateRoomLastMessage(ctx context.Context, roomID bson.ObjectID, lastMessage string, senderID bson.ObjectID) error {
+func (r *repository) UpdateRoomLastMessage(ctx context.Context, roomID bson.ObjectID, lastMessage, lastMessageType string, senderID bson.ObjectID) error {
 	update := bson.M{
 		"$set": bson.M{
 			"lastMessage":         lastMessage,
+			"lastMessageType":     lastMessageType,
 			"lastMessageSenderId": senderID,
 			"lastUpdated":         time.Now(),
 		},
@@ -244,8 +245,11 @@ func (r *repository) SoftDeleteMessage(ctx context.Context, messageID bson.Objec
 			"isDeleted": true,
 			"updatedAt": time.Now(),
 		},
-		// Clear reactions — deleted messages should not show emoji counts
-		"$unset": bson.M{"reactions": ""},
+		// Clear reactions and metadata — deleted messages should not show media or emojis
+		"$unset": bson.M{
+			"reactions": "",
+			"metadata":  "",
+		},
 	}
 	_, err := r.messages.UpdateOne(ctx, bson.M{"_id": messageID}, update)
 	return err
