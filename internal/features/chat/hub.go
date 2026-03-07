@@ -13,11 +13,13 @@ const sendBufSize = 256
 
 // Hub manages active WebSocket connections
 type Hub struct {
-	clients    map[string]map[*clientContext]bool
-	clientsMu  sync.RWMutex
-	register   chan *clientContext
-	unregister chan *clientContext
-	broadcast  chan broadcastMessage
+	clients       map[string]map[*clientContext]bool
+	clientsMu     sync.RWMutex
+	disconnecting map[string]bool // users in process of disconnecting
+	discMu        sync.RWMutex
+	register      chan *clientContext
+	unregister    chan *clientContext
+	broadcast     chan broadcastMessage
 }
 
 // clientContext holds one WebSocket connection and its dedicated send channel.
@@ -37,10 +39,11 @@ type broadcastMessage struct {
 // NewHub creates a new Hub instance with buffered channels for high throughput
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[string]map[*clientContext]bool),
-		register:   make(chan *clientContext, 64),
-		unregister: make(chan *clientContext, 64),
-		broadcast:  make(chan broadcastMessage, 256),
+		clients:       make(map[string]map[*clientContext]bool),
+		disconnecting: make(map[string]bool),
+		register:      make(chan *clientContext, 64),
+		unregister:    make(chan *clientContext, 64),
+		broadcast:     make(chan broadcastMessage, 256),
 	}
 }
 
@@ -87,6 +90,10 @@ func (h *Hub) Run() {
 				}
 			}
 			h.clientsMu.Unlock()
+			// Clear disconnecting flag after processing
+			h.discMu.Lock()
+			delete(h.disconnecting, client.userID)
+			h.discMu.Unlock()
 
 		case msg := <-h.broadcast:
 			h.clientsMu.RLock()
@@ -127,8 +134,24 @@ func (h *Hub) SendMessage(userID string, msg models.WSMessage) error {
 	return h.SendToUsers([]string{userID}, msg)
 }
 
-// IsUserOnline checks if a user has any active WebSocket connections
+// MarkDisconnecting marks a user as in the process of disconnecting.
+// This ensures IsUserOnline returns false immediately, even before unregister is processed.
+func (h *Hub) MarkDisconnecting(userID string) {
+	h.discMu.Lock()
+	h.disconnecting[userID] = true
+	h.discMu.Unlock()
+}
+
+// IsUserOnline checks if a user has any active WebSocket connections.
+// Returns false if the user is in the process of disconnecting.
 func (h *Hub) IsUserOnline(userID string) bool {
+	h.discMu.RLock()
+	if h.disconnecting[userID] {
+		h.discMu.RUnlock()
+		return false
+	}
+	h.discMu.RUnlock()
+
 	h.clientsMu.RLock()
 	defer h.clientsMu.RUnlock()
 	conns, ok := h.clients[userID]

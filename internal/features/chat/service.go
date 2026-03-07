@@ -598,6 +598,7 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 	go s.broadcastUserPresence(userID, true)
 
 	defer func() {
+		s.hub.MarkDisconnecting(userID) // Mark immediately so IsUserOnline returns false
 		s.hub.unregister <- client
 		// Notify room participants that this user has gone offline
 		go s.broadcastUserPresence(userID, false)
