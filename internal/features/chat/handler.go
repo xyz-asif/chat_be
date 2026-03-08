@@ -107,14 +107,20 @@ func (h *Handler) SendMessage(c *fiber.Ctx) error {
 
 	roomID := c.Params("roomId")
 	var req struct {
-		Content   string `json:"content"`
-		ReplyToID string `json:"replyToId,omitempty"`
+		Content   string                `json:"content"`
+		Type      string                `json:"type"`
+		Metadata  *models.MediaMetadata `json:"metadata,omitempty"`
+		ReplyToID string                `json:"replyToId,omitempty"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return response.BadRequest(c, "Invalid request body")
 	}
 
-	msg, err := h.service.SendMessage(c.Context(), user.ID.Hex(), roomID, req.Content, req.ReplyToID)
+	if req.Type == "" {
+		req.Type = models.MessageTypeText
+	}
+
+	msg, err := h.service.SendMessage(c.Context(), user.ID.Hex(), roomID, req.Content, req.Type, req.Metadata, req.ReplyToID)
 	if err != nil {
 		return response.BadRequest(c, err.Error())
 	}

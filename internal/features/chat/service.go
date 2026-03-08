@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
@@ -14,7 +16,7 @@ import (
 )
 
 type Service interface {
-	SendMessage(ctx context.Context, senderID, roomID, content, replyToID string) (*models.MessageResponse, error)
+	SendMessage(ctx context.Context, senderID, roomID, content, msgType string, metadata *models.MediaMetadata, replyToID string) (*models.MessageResponse, error)
 	GetOrCreateDirectRoom(ctx context.Context, user1ID, user2ID string) (*models.RoomResponse, error)
 	GetRoomMessages(ctx context.Context, userID, roomID string, limit int, beforeID string) (*models.MessagesPage, error)
 	GetUserRooms(ctx context.Context, userID string) ([]models.RoomResponse, error)
@@ -75,7 +77,7 @@ func (s *service) GetOrCreateDirectRoom(ctx context.Context, user1IDStr, user2ID
 	return s.buildRoomResponse(ctx, room, user1IDStr)
 }
 
-func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, content, replyToIDStr string) (*models.MessageResponse, error) {
+func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, content, msgType string, metadata *models.MediaMetadata, replyToIDStr string) (*models.MessageResponse, error) {
 	senderID, err := bson.ObjectIDFromHex(senderIDStr)
 	if err != nil {
 		return nil, errors.New("invalid sender id")
@@ -85,11 +87,8 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 		return nil, errors.New("invalid room id")
 	}
 
-	if content == "" {
-		return nil, errors.New("message content cannot be empty")
-	}
-	if len([]rune(content)) > 2000 {
-		return nil, errors.New("message content exceeds maximum length of 2000 characters")
+	if err := validateMessageContent(msgType, content); err != nil {
+		return nil, err
 	}
 
 	room, err := s.repo.GetRoomByID(ctx, roomID)
@@ -114,7 +113,9 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 	msg := &models.Message{
 		RoomID:    roomID,
 		SenderID:  senderID,
+		Type:      msgType,
 		Content:   content,
+		Metadata:  metadata,
 		Status:    models.MessageStatusSent,
 		ReplyToID: replyToObjId,
 	}
@@ -135,7 +136,8 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 	}
 
 	// Update room last message + sender
-	if err := s.repo.UpdateRoomLastMessage(ctx, roomID, content, senderID); err != nil {
+	preview := getMessagePreview(msgType, content, metadata)
+	if err := s.repo.UpdateRoomLastMessage(ctx, roomID, preview, msgType, senderID); err != nil {
 		log.Printf("SendMessage: failed to update room last message for room %s: %v", roomIDStr, err)
 	}
 
@@ -163,9 +165,10 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 		Type:   "room_updated",
 		RoomID: roomIDStr,
 		Payload: map[string]interface{}{
-			"lastMessage":   content,
-			"lastUpdated":   msg.CreatedAt,
-			"lastSenderId":  senderIDStr,
+			"lastMessage":     preview,
+			"lastMessageType": msgType,
+			"lastUpdated":     msg.CreatedAt,
+			"lastSenderId":    senderIDStr,
 		},
 	})
 
@@ -329,6 +332,10 @@ func (s *service) EditMessage(ctx context.Context, userIDStr, messageIDStr, cont
 	// Only the sender can edit their own message
 	if msg.SenderID != senderID {
 		return errors.New("unauthorized: only the sender can edit this message")
+	}
+
+	if msg.Type != models.MessageTypeText && msg.Type != "" {
+		return errors.New("only text messages can be edited")
 	}
 
 	if msg.IsDeleted {
@@ -591,10 +598,14 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 	go s.broadcastUserPresence(userID, true)
 
 	defer func() {
+		s.hub.MarkDisconnecting(userID) // Mark immediately so IsUserOnline returns false
 		s.hub.unregister <- client
 		// Notify room participants that this user has gone offline
 		go s.broadcastUserPresence(userID, false)
 	}()
+
+	// Start ping/pong to detect dead connections quickly
+	go s.pingPong(c, client)
 
 	for {
 		var msg models.WSMessage
@@ -645,12 +656,13 @@ func isUserInRoom(room *models.Room, userID bson.ObjectID) bool {
 
 func (s *service) buildRoomResponse(ctx context.Context, room *models.Room, forUserID string) (*models.RoomResponse, error) {
 	resp := &models.RoomResponse{
-		ID:           room.ID.Hex(),
-		Type:         room.Type,
-		Name:         room.Name,
-		LastMessage:  room.LastMessage,
-		LastUpdated:  room.LastUpdated,
-		Participants: make([]models.ParticipantInfo, 0, len(room.Participants)),
+		ID:              room.ID.Hex(),
+		Type:            room.Type,
+		Name:            room.Name,
+		LastMessage:     room.LastMessage,
+		LastMessageType: room.LastMessageType,
+		LastUpdated:     room.LastUpdated,
+		Participants:    make([]models.ParticipantInfo, 0, len(room.Participants)),
 	}
 
 	// Unread count for the requesting user
@@ -687,13 +699,19 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 		ID:        msg.ID.Hex(),
 		RoomID:    msg.RoomID.Hex(),
 		SenderID:  msg.SenderID.Hex(),
+		Type:      msg.Type,
 		Content:   msg.Content,
+		Metadata:  msg.Metadata,
 		Status:    msg.Status,
 		Reactions: msg.Reactions,
 		IsEdited:  msg.IsEdited,
 		IsDeleted: msg.IsDeleted,
 		CreatedAt: msg.CreatedAt,
 		UpdatedAt: msg.UpdatedAt,
+	}
+
+	if resp.Type == "" {
+		resp.Type = models.MessageTypeText
 	}
 
 	// Populate sender display info so frontend does not need a separate user lookup
@@ -709,10 +727,15 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 				ID:        replyMsg.ID.Hex(),
 				RoomID:    replyMsg.RoomID.Hex(),
 				SenderID:  replyMsg.SenderID.Hex(),
+				Type:      replyMsg.Type,
 				Content:   replyMsg.Content,
+				Metadata:  replyMsg.Metadata,
 				Status:    replyMsg.Status,
 				IsDeleted: replyMsg.IsDeleted,
 				CreatedAt: replyMsg.CreatedAt,
+			}
+			if replyResp.Type == "" {
+				replyResp.Type = models.MessageTypeText
 			}
 			if replySender, err := s.userRepo.GetUserByID(ctx, replyMsg.SenderID); err == nil && replySender != nil {
 				replyResp.SenderName = replySender.DisplayName
@@ -723,4 +746,93 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 	}
 
 	return resp
+}
+
+// pingPong sends periodic ping frames to detect dead connections.
+// If the client doesn't respond with a pong within the timeout, the connection is closed.
+func (s *service) pingPong(c *websocket.Conn, client *clientContext) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+				// Failed to send ping, close the connection
+				c.Close()
+				return
+			}
+		case <-client.send:
+			// Client disconnected, exit
+			return
+		}
+	}
+}
+
+func validateMessageContent(msgType, content string) error {
+	switch msgType {
+	case models.MessageTypeText:
+		if content == "" {
+			return errors.New("message content cannot be empty")
+		}
+		if len([]rune(content)) > 2000 {
+			return errors.New("message content exceeds maximum length of 2000 characters")
+		}
+	case models.MessageTypeImage, models.MessageTypeVideo, models.MessageTypeAudio, models.MessageTypeFile, models.MessageTypeGIF, models.MessageTypeLink:
+		if !strings.HasPrefix(content, "https://") {
+			return errors.New("media content must be a valid HTTPS URL")
+		}
+		if len([]rune(content)) > 2048 {
+			return errors.New("media URL exceeds maximum length of 2048 characters")
+		}
+		u, err := url.Parse(content)
+		if err != nil {
+			return errors.New("invalid media URL")
+		}
+		host := u.Host
+
+		// Ensure URL has a valid host
+		if host == "" {
+			return errors.New("URL must contain a valid host")
+		}
+
+		if msgType == models.MessageTypeGIF {
+			isGiphy := host == "giphy.com" || strings.HasSuffix(host, ".giphy.com")
+			isCloudinary := host == "res.cloudinary.com"
+			if !isGiphy && !isCloudinary {
+				return errors.New("domain not whitelisted for GIF")
+			}
+		} else if msgType != models.MessageTypeLink {
+			if host != "res.cloudinary.com" {
+				return errors.New("domain not whitelisted for media")
+			}
+		}
+	default:
+		return errors.New("invalid or unknown message type")
+	}
+	return nil
+}
+
+func getMessagePreview(msgType, content string, metadata *models.MediaMetadata) string {
+	switch msgType {
+	case models.MessageTypeText:
+		return content
+	case models.MessageTypeImage:
+		return "📷 Photo"
+	case models.MessageTypeVideo:
+		return "🎥 Video"
+	case models.MessageTypeAudio:
+		return "🎵 Audio"
+	case models.MessageTypeFile:
+		if metadata != nil && metadata.FileName != "" {
+			return "📎 " + metadata.FileName
+		}
+		return "📎 File"
+	case models.MessageTypeGIF:
+		return "GIF"
+	case models.MessageTypeLink:
+		return "🔗 Link"
+	default:
+		return "Message"
+	}
 }
