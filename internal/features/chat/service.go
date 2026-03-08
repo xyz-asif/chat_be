@@ -604,6 +604,9 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 		go s.broadcastUserPresence(userID, false)
 	}()
 
+	// Start ping/pong to detect dead connections quickly
+	go s.pingPong(c, client)
+
 	for {
 		var msg models.WSMessage
 		if err := c.ReadJSON(&msg); err != nil {
@@ -743,6 +746,27 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 	}
 
 	return resp
+}
+
+// pingPong sends periodic ping frames to detect dead connections.
+// If the client doesn't respond with a pong within the timeout, the connection is closed.
+func (s *service) pingPong(c *websocket.Conn, client *clientContext) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+				// Failed to send ping, close the connection
+				c.Close()
+				return
+			}
+		case <-client.send:
+			// Client disconnected, exit
+			return
+		}
+	}
 }
 
 func validateMessageContent(msgType, content string) error {
