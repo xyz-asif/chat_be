@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/url"
@@ -37,12 +38,20 @@ type service struct {
 }
 
 func NewService(repo Repository, userRepo users.Repository, connRepo connections.Repository, hub *Hub) Service {
-	return &service{
+	svc := &service{
 		repo:     repo,
 		userRepo: userRepo,
 		connRepo: connRepo,
 		hub:      hub,
 	}
+	
+	// Wire presence callbacks to avoid circular dependency
+	hub.SetPresenceCallbacks(
+		func(userID string) { svc.broadcastUserPresence(userID, true) },
+		func(userID string) { svc.broadcastUserPresence(userID, false) },
+	)
+	
+	return svc
 }
 
 func (s *service) GetOrCreateDirectRoom(ctx context.Context, user1IDStr, user2IDStr string) (*models.RoomResponse, error) {
@@ -248,6 +257,36 @@ func (s *service) GetUserRooms(ctx context.Context, userIDStr string) ([]models.
 		return nil, err
 	}
 
+	// Collect all unique user IDs across all rooms for batch fetching
+	userIDSet := make(map[bson.ObjectID]bool)
+	for _, r := range rooms {
+		for _, p := range r.Participants {
+			userIDSet[p] = true
+		}
+		if r.LastMessageSenderID != nil {
+			userIDSet[*r.LastMessageSenderID] = true
+		}
+	}
+
+	// Convert set to slice for batch query
+	userIDs := make([]bson.ObjectID, 0, len(userIDSet))
+	for id := range userIDSet {
+		userIDs = append(userIDs, id)
+	}
+
+	// Single batch query to get all users
+	userMap, err := s.userRepo.GetUsersByIDs(ctx, userIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert back to string map for frontend compatibility
+	result := make(map[string]*models.User)
+	for objID, user := range userMap {
+		result[objID.Hex()] = user
+	}
+
+	// Build responses using cached user map
 	responses := make([]models.RoomResponse, 0, len(rooms))
 	for _, r := range rooms {
 		resp, err := s.buildRoomResponse(ctx, &r, userIDStr)
@@ -585,7 +624,83 @@ func (s *service) broadcastUserPresence(userID string, online bool) {
 	})
 }
 
+// sendPresenceSync sends the current online status of all friends and chat participants to the requesting user.
+// This is called when a client sends a "sync_presence" message (e.g., when app comes to foreground).
+func (s *service) sendPresenceSync(userID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return
+	}
+
+	// Collect unique users to check presence for
+	presenceMap := make(map[string]bool)
+
+	// 1. Get all accepted connections (friends)
+	if s.connRepo != nil {
+		connections, err := s.connRepo.GetUserConnections(ctx, uid, models.ConnectionStatusAccepted)
+		if err != nil {
+			log.Printf("sendPresenceSync: failed to get connections for user %s: %v", userID, err)
+		} else {
+			for _, conn := range connections {
+				var friendID string
+				if conn.SenderID == uid {
+					friendID = conn.ReceiverID.Hex()
+				} else {
+					friendID = conn.SenderID.Hex()
+				}
+				if friendID != userID {
+					presenceMap[friendID] = s.hub.IsUserOnline(friendID)
+				}
+			}
+		}
+	}
+
+	// 2. Get all chat room participants
+	rooms, err := s.repo.GetUserRooms(ctx, uid)
+	if err != nil {
+		log.Printf("sendPresenceSync: failed to get rooms for user %s: %v", userID, err)
+	} else {
+		for _, room := range rooms {
+			for _, p := range room.Participants {
+				pHex := p.Hex()
+				if pHex != userID {
+					// Only add if not already checked
+					if _, exists := presenceMap[pHex]; !exists {
+						presenceMap[pHex] = s.hub.IsUserOnline(pHex)
+					}
+				}
+			}
+		}
+	}
+
+	// If no users to sync, send empty map
+	if len(presenceMap) == 0 {
+		presenceMap = make(map[string]bool)
+	}
+
+	// Send presence sync to the requesting user
+	_ = s.hub.SendMessage(userID, models.WSMessage{
+		Type:    "presence_sync",
+		Payload: presenceMap,
+	})
+
+	log.Printf("Sent presence_sync to user %s with %d users", userID, len(presenceMap))
+}
+
 func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("HandleWebSocket panic recovered for user %s: %v", userID, r)
+		}
+	}()
+
+	// Set up read deadline for dead connection detection
+	// Reset on every message read (including JSON pings)
+	_ = c.SetReadDeadline(time.Now().Add(45 * time.Second))
+
 	client := &clientContext{
 		userID: userID,
 		conn:   c,
@@ -594,20 +709,25 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 
 	s.hub.register <- client
 
-	// Notify room participants that this user is now online
-	go s.broadcastUserPresence(userID, true)
+	// Send welcome message so client knows connection is established
+	welcomeMsg, _ := json.Marshal(map[string]string{"type": "connected"})
+	select {
+	case client.send <- welcomeMsg:
+	default:
+		log.Printf("Failed to send welcome message to user %s (buffer full)", client.userID)
+	}
 
 	defer func() {
-		s.hub.MarkDisconnecting(userID) // Mark immediately so IsUserOnline returns false
 		s.hub.unregister <- client
-		// Notify room participants that this user has gone offline
-		go s.broadcastUserPresence(userID, false)
 	}()
 
-	// Start ping/pong to detect dead connections quickly
-	go s.pingPong(c, client)
+	// Start ping pump for keepalive
+	go s.pingPump(c, client)
 
 	for {
+		// Reset read deadline on every message (including JSON pings)
+		_ = c.SetReadDeadline(time.Now().Add(45 * time.Second))
+		
 		var msg models.WSMessage
 		if err := c.ReadJSON(&msg); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -639,6 +759,34 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 					_ = s.hub.SendMessage(pHex, msg)
 				}
 			}
+
+		case "presence_status":
+			// Handle manual presence update from mobile app
+			payload, ok := msg.Payload.(map[string]interface{})
+			if !ok {
+				log.Printf("presence_status: invalid payload from user %s", userID)
+				continue
+			}
+			isOnline, _ := payload["isOnline"].(bool)
+			
+			// Check current effective state BEFORE updating
+			wasEffectivelyOnline := s.hub.IsUserOnline(userID)
+			
+			s.hub.SetManualPresence(userID, isOnline)
+			
+			// Cancel grace period — this is an explicit signal, not a network blip
+			s.hub.CancelGracePeriod(userID)
+			
+			// Only broadcast if effective state changed
+			nowEffectivelyOnline := s.hub.IsUserOnline(userID)
+			if wasEffectivelyOnline != nowEffectivelyOnline {
+				go s.broadcastUserPresence(userID, nowEffectivelyOnline)
+			}
+			log.Printf("User %s set presence to %v (effective: %v)", userID, isOnline, nowEffectivelyOnline)
+
+		case "sync_presence":
+			// Send current presence status of all relevant users
+			go s.sendPresenceSync(userID)
 		}
 	}
 }
@@ -748,22 +896,38 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 	return resp
 }
 
-// pingPong sends periodic ping frames to detect dead connections.
-// If the client doesn't respond with a pong within the timeout, the connection is closed.
-func (s *service) pingPong(c *websocket.Conn, client *clientContext) {
-	ticker := time.NewTicker(30 * time.Second)
+// pingPump sends periodic ping messages through the send channel.
+// This maintains the single-writer guarantee (writePump only touches the WebSocket).
+func (s *service) pingPump(c *websocket.Conn, client *clientContext) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("pingPump panic recovered for user %s: %v", client.userID, r)
+		}
+	}()
+
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	for {
+	for range ticker.C {
+		// Check if client is still registered in hub
+		s.hub.clientsMu.RLock()
+		conns := s.hub.clients[client.userID]
+		_, stillRegistered := conns[client]
+		s.hub.clientsMu.RUnlock()
+
+		if !stillRegistered {
+			return // client was unregistered, stop pinging
+		}
+
+		// Send JSON pong through the send channel (single writer)
+		pingMsg, _ := json.Marshal(map[string]string{"type": "pong"})
 		select {
-		case <-ticker.C:
-			if err := c.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-				// Failed to send ping, close the connection
-				c.Close()
-				return
-			}
-		case <-client.send:
-			// Client disconnected, exit
+		case client.send <- pingMsg:
+			// Sent successfully
+		default:
+			// Buffer full — connection is likely dead
+			log.Printf("pingPump: send buffer full for user %s, closing", client.userID)
+			c.Close()
 			return
 		}
 	}

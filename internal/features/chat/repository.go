@@ -2,6 +2,7 @@ package chat
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/xyz-asif/gotodo/internal/models"
@@ -95,7 +96,7 @@ func (r *repository) GetDirectRoom(ctx context.Context, user1ID, user2ID bson.Ob
 }
 
 // GetOrCreateDirectRoomAtomic finds or atomically creates a direct room between two users.
-// Using FindOneAndUpdate with upsert eliminates the check-then-insert race condition.
+// Handles race conditions, duplicate key errors, and ensures data integrity.
 func (r *repository) GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error) {
 	// First, try to find the existing direct room
 	room, err := r.GetDirectRoom(ctx, user1ID, user2ID)
@@ -103,10 +104,20 @@ func (r *repository) GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, u
 		return nil, err
 	}
 	if room != nil {
+		// Verify room has both participants (data integrity check)
+		if len(room.Participants) != 2 {
+			log.Printf("WARNING: Room %s has %d participants, expected 2. Fixing...", room.ID.Hex(), len(room.Participants))
+			// Try to fix the room by ensuring both users are participants
+			room.Participants = []bson.ObjectID{user1ID, user2ID}
+			_, _ = r.rooms.UpdateOne(ctx, bson.M{"_id": room.ID}, bson.M{
+				"$set": bson.M{"participants": room.Participants},
+			})
+		}
 		return room, nil
 	}
 
 	// Create a new direct room if it doesn't exist
+	now := time.Now()
 	newRoom := &models.Room{
 		Type:         models.RoomTypeDirect,
 		Participants: []bson.ObjectID{user1ID, user2ID},
@@ -114,13 +125,36 @@ func (r *repository) GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, u
 			user1ID.Hex(): 0,
 			user2ID.Hex(): 0,
 		},
+		CreatedAt:   now,
+		LastUpdated: now,
 	}
 
 	if err := r.CreateRoom(ctx, newRoom); err != nil {
+		// Check if room was created by concurrent request (unique index violation)
+		if mongo.IsDuplicateKeyError(err) {
+			// Room was created by another concurrent request, fetch it
+			return r.GetDirectRoom(ctx, user1ID, user2ID)
+		}
 		return nil, err
 	}
 
-	return newRoom, nil
+	// Verify the room was created correctly by re-fetching it
+	// This ensures read-after-write consistency
+	createdRoom, err := r.GetRoomByID(ctx, newRoom.ID)
+	if err != nil {
+		log.Printf("WARNING: Failed to fetch created room %s: %v", newRoom.ID.Hex(), err)
+		// Return the in-memory room as fallback
+		return newRoom, nil
+	}
+
+	// Verify participants are correct
+	if len(createdRoom.Participants) != 2 {
+		log.Printf("WARNING: Created room %s has %d participants, expected 2", createdRoom.ID.Hex(), len(createdRoom.Participants))
+		// Fix the room participants
+		createdRoom.Participants = []bson.ObjectID{user1ID, user2ID}
+	}
+
+	return createdRoom, nil
 }
 
 func (r *repository) GetUserRooms(ctx context.Context, userID bson.ObjectID) ([]models.Room, error) {

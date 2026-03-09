@@ -46,7 +46,7 @@ func main() {
 	go chatHub.Run() // Run the hub in a background goroutine
 
 	// Initialize services
-	userService := users.NewService(userRepo)
+	userService := users.NewService(userRepo, chatHub, connectionRepo, chatRepo)
 	connectionService := connections.NewService(connectionRepo)
 	chatService := chat.NewService(chatRepo, userRepo, connectionRepo, chatHub)
 

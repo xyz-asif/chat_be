@@ -15,6 +15,7 @@ type Repository interface {
 	CreateUser(ctx context.Context, user *models.User) error
 	GetUserByFirebaseUID(ctx context.Context, uid string) (*models.User, error)
 	GetUserByID(ctx context.Context, id bson.ObjectID) (*models.User, error)
+	GetUsersByIDs(ctx context.Context, ids []bson.ObjectID) (map[bson.ObjectID]*models.User, error)
 	UpdateUser(ctx context.Context, id bson.ObjectID, updates map[string]interface{}) error // MVP Feature: User Profile Management
 	IncrementProfileViews(ctx context.Context, userID bson.ObjectID) error                  // MVP Feature: User Profile Management
 	FollowUser(ctx context.Context, followerID, followedID bson.ObjectID) error
@@ -217,4 +218,30 @@ func (r *repository) SearchUsers(ctx context.Context, query string, limit, offse
 	}
 
 	return users, nil
+}
+
+// GetUsersByIDs fetches multiple users by their ObjectIDs in a single query
+func (r *repository) GetUsersByIDs(ctx context.Context, ids []bson.ObjectID) (map[bson.ObjectID]*models.User, error) {
+	if len(ids) == 0 {
+		return make(map[bson.ObjectID]*models.User), nil
+	}
+
+	cursor, err := r.collection.Find(ctx, bson.M{"_id": bson.M{"$in": ids}})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var users []models.User
+	if err := cursor.All(ctx, &users); err != nil {
+		return nil, err
+	}
+
+	// Convert slice to map for efficient lookup
+	userMap := make(map[bson.ObjectID]*models.User, len(users))
+	for i := range users {
+		userMap[users[i].ID] = &users[i]
+	}
+
+	return userMap, nil
 }

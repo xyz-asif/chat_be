@@ -56,10 +56,10 @@ func (s *service) SendRequest(ctx context.Context, senderIDStr, receiverIDStr st
 			return nil, errors.New("cannot send request")
 		}
 
-		// If rejected, we allow resending by updating the existing one to pending
+		// If rejected, update both status and direction in a single DB write
 		if existingConn.Status == models.ConnectionStatusRejected {
 			// Ensure the new sender is the one initiating again (might have been rejected by the other party)
-			if err := s.repo.UpdateConnectionStatus(ctx, existingConn.ID, models.ConnectionStatusPending); err != nil {
+			if err := s.repo.UpdateConnectionDirection(ctx, existingConn.ID, senderID, receiverID); err != nil {
 				return nil, err
 			}
 			existingConn.Status = models.ConnectionStatusPending

@@ -5,6 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
+	"github.com/xyz-asif/gotodo/internal/models"
 )
 
 // MVP Launch: Rate Limiting Configuration - Completed
@@ -16,9 +17,8 @@ func RateLimiterConfig() fiber.Handler {
 		Expiration: 1 * time.Minute,
 		KeyGenerator: func(c *fiber.Ctx) string {
 			// Use user ID if authenticated, otherwise IP
-			user := c.Locals("user")
-			if user != nil {
-				return "user:" + c.Locals("userID").(string)
+			if user, ok := c.Locals("user").(*models.User); ok && user != nil {
+				return "user:" + user.ID.Hex()
 			}
 			return c.IP()
 		},
@@ -37,9 +37,8 @@ func StrictRateLimiter() fiber.Handler {
 		Max:        20, // 20 requests per minute for writes
 		Expiration: 1 * time.Minute,
 		KeyGenerator: func(c *fiber.Ctx) string {
-			user := c.Locals("user")
-			if user != nil {
-				return "user:" + c.Locals("userID").(string)
+			if user, ok := c.Locals("user").(*models.User); ok && user != nil {
+				return "user:" + user.ID.Hex()
 			}
 			return c.IP()
 		},
@@ -58,9 +57,8 @@ func GenerousRateLimiter() fiber.Handler {
 		Max:        300, // 300 requests per minute for reads
 		Expiration: 1 * time.Minute,
 		KeyGenerator: func(c *fiber.Ctx) string {
-			user := c.Locals("user")
-			if user != nil {
-				return "user:" + c.Locals("userID").(string)
+			if user, ok := c.Locals("user").(*models.User); ok && user != nil {
+				return "user:" + user.ID.Hex()
 			}
 			return c.IP()
 		},
