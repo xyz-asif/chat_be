@@ -107,3 +107,24 @@ func (h *Handler) Search(c *fiber.Ctx) error {
 
 	return response.OK(c, "Users retrieved", users)
 }
+
+// SearchWithConnectionStatus searches for users and includes connection status
+// If no query is provided, returns all users with pagination
+// Endpoint: GET /api/v1/users/search-with-status?q=query&limit=20&offset=0
+func (h *Handler) SearchWithConnectionStatus(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	query := c.Query("q", "") // Empty query returns all users
+	limit := c.QueryInt("limit", 20)
+	offset := c.QueryInt("offset", 0)
+
+	result, err := h.service.SearchUsersWithConnectionStatus(c.Context(), user.ID.Hex(), query, limit, offset)
+	if err != nil {
+		return response.InternalError(c, err.Error())
+	}
+
+	return response.OK(c, "Users retrieved with connection status", result)
+}

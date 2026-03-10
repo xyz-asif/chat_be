@@ -27,6 +27,7 @@ type Service interface {
 	MarkRoomAsRead(ctx context.Context, userID, roomID string) error
 	EditMessage(ctx context.Context, userID, messageID, content string) error
 	DeleteMessage(ctx context.Context, userID, messageID string) error
+	DeleteChat(ctx context.Context, userID, roomID string) error
 	HandleWebSocket(c *websocket.Conn, userID string)
 }
 
@@ -454,6 +455,63 @@ func (s *service) DeleteMessage(ctx context.Context, userIDStr, messageIDStr str
 	return nil
 }
 
+// DeleteChat deletes a chat room and all its messages
+// For direct chats, also removes the connection between users
+func (s *service) DeleteChat(ctx context.Context, userIDStr, roomIDStr string) error {
+	userID, err := bson.ObjectIDFromHex(userIDStr)
+	if err != nil {
+		return errors.New("invalid user id")
+	}
+	roomID, err := bson.ObjectIDFromHex(roomIDStr)
+	if err != nil {
+		return errors.New("invalid room id")
+	}
+
+	// Get the room to verify user is a participant
+	room, err := s.repo.GetRoomByID(ctx, roomID)
+	if err != nil {
+		return errors.New("room not found")
+	}
+
+	// Verify user is a participant
+	if !isUserInRoom(room, userID) {
+		return errors.New("unauthorized: not a participant")
+	}
+
+	// Delete all messages in the room
+	if err := s.repo.DeleteMessagesByRoom(ctx, roomID); err != nil {
+		return err
+	}
+
+	// Delete the room
+	if err := s.repo.DeleteRoom(ctx, roomID); err != nil {
+		return err
+	}
+
+	// For direct rooms, also delete the connection
+	if room.Type == models.RoomTypeDirect && len(room.Participants) == 2 {
+		var otherUserID bson.ObjectID
+		for _, p := range room.Participants {
+			if p != userID {
+				otherUserID = p
+				break
+			}
+		}
+		
+		// Find and delete the connection
+		conn, err := s.connRepo.GetConnectionBetweenUsers(ctx, userID, otherUserID)
+		if err == nil && conn != nil {
+			// Remove the connection (unfriend)
+			if err := s.connRepo.DeleteConnection(ctx, conn.ID); err != nil {
+				log.Printf("Failed to delete connection for room %s: %v", roomIDStr, err)
+				// Don't fail the whole operation if connection deletion fails
+			}
+		}
+	}
+
+	return nil
+}
+
 func (s *service) GetUserPresence(ctx context.Context, userIDStr string) (map[string]interface{}, error) {
 	_, err := bson.ObjectIDFromHex(userIDStr)
 	if err != nil {
@@ -693,13 +751,19 @@ func (s *service) sendPresenceSync(userID string) {
 func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("HandleWebSocket panic recovered for user %s: %v", userID, r)
+			log.Printf("[WS PANIC] HandleWebSocket panic recovered for user %s: %v", userID, r)
 		}
+		log.Printf("[WS] HandleWebSocket ended for user %s", userID)
 	}()
+
+	log.Printf("[WS] New WebSocket connection for user %s from %s", userID, c.RemoteAddr().String())
 
 	// Set up read deadline for dead connection detection
 	// Reset on every message read (including JSON pings)
-	_ = c.SetReadDeadline(time.Now().Add(45 * time.Second))
+	if err := c.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+		log.Printf("[WS ERROR] Failed to set read deadline for user %s: %v", userID, err)
+		return
+	}
 
 	client := &clientContext{
 		userID: userID,
@@ -707,36 +771,62 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 		send:   make(chan []byte, sendBufSize),
 	}
 
+	log.Printf("[WS] Registering client for user %s", userID)
 	s.hub.register <- client
 
 	// Send welcome message so client knows connection is established
 	welcomeMsg, _ := json.Marshal(map[string]string{"type": "connected"})
 	select {
 	case client.send <- welcomeMsg:
+		log.Printf("[WS] Sent welcome message to user %s", userID)
 	default:
-		log.Printf("Failed to send welcome message to user %s (buffer full)", client.userID)
+		log.Printf("[WS ERROR] Failed to send welcome message to user %s (buffer full)", userID)
 	}
 
 	defer func() {
+		log.Printf("[WS] Unregistering client for user %s", userID)
 		s.hub.unregister <- client
 	}()
 
 	// Start ping pump for keepalive
 	go s.pingPump(c, client)
 
+	messageCount := 0
 	for {
 		// Reset read deadline on every message (including JSON pings)
-		_ = c.SetReadDeadline(time.Now().Add(45 * time.Second))
-		
+		if err := c.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
+			break
+		}
+
 		var msg models.WSMessage
 		if err := c.ReadJSON(&msg); err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				// log error
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
+				log.Printf("[WS CLOSE] Unexpected close for user %s: %v", userID, err)
+			} else if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("[WS CLOSE] Normal close for user %s: %v", userID, err)
+			} else {
+				log.Printf("[WS ERROR] Read error for user %s: %v (type: %T)", userID, err, err)
 			}
 			break
 		}
 
+		messageCount++
+		if messageCount <= 5 || messageCount%100 == 0 {
+			log.Printf("[WS] Received message #%d from user %s: type=%s", messageCount, userID, msg.Type)
+		}
+
 		switch msg.Type {
+		case "ping":
+			// Client sent ping, respond with pong
+			pongMsg, _ := json.Marshal(map[string]string{"type": "pong"})
+			select {
+			case client.send <- pongMsg:
+				// Successfully queued pong
+			default:
+				log.Printf("[WS ERROR] Failed to send pong to user %s (buffer full)", userID)
+			}
+
 		case "typing_start", "typing_stop":
 			if msg.RoomID == "" {
 				continue
@@ -764,29 +854,32 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 			// Handle manual presence update from mobile app
 			payload, ok := msg.Payload.(map[string]interface{})
 			if !ok {
-				log.Printf("presence_status: invalid payload from user %s", userID)
+				log.Printf("[WS] presence_status: invalid payload from user %s", userID)
 				continue
 			}
 			isOnline, _ := payload["isOnline"].(bool)
-			
+
 			// Check current effective state BEFORE updating
 			wasEffectivelyOnline := s.hub.IsUserOnline(userID)
-			
+
 			s.hub.SetManualPresence(userID, isOnline)
-			
+
 			// Cancel grace period — this is an explicit signal, not a network blip
 			s.hub.CancelGracePeriod(userID)
-			
+
 			// Only broadcast if effective state changed
 			nowEffectivelyOnline := s.hub.IsUserOnline(userID)
 			if wasEffectivelyOnline != nowEffectivelyOnline {
 				go s.broadcastUserPresence(userID, nowEffectivelyOnline)
 			}
-			log.Printf("User %s set presence to %v (effective: %v)", userID, isOnline, nowEffectivelyOnline)
+			log.Printf("[WS] User %s set presence to %v (effective: %v)", userID, isOnline, nowEffectivelyOnline)
 
 		case "sync_presence":
 			// Send current presence status of all relevant users
 			go s.sendPresenceSync(userID)
+
+		default:
+			log.Printf("[WS] Unknown message type from user %s: %s", userID, msg.Type)
 		}
 	}
 }

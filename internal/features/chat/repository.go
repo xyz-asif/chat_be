@@ -36,6 +36,10 @@ type Repository interface {
 	IncrementUnreadCounts(ctx context.Context, roomID bson.ObjectID, participants []bson.ObjectID, exceptUserID string) error
 	ResetUnreadCount(ctx context.Context, roomID bson.ObjectID, userID string) error
 	MarkRoomMessagesAsRead(ctx context.Context, roomID, senderID bson.ObjectID) error
+
+	// Delete room and all associated messages
+	DeleteRoom(ctx context.Context, roomID bson.ObjectID) error
+	DeleteMessagesByRoom(ctx context.Context, roomID bson.ObjectID) error
 }
 
 type repository struct {
@@ -332,5 +336,17 @@ func (r *repository) MarkRoomMessagesAsRead(ctx context.Context, roomID, readerI
 		},
 	}
 	_, err := r.messages.UpdateMany(ctx, filter, update)
+	return err
+}
+
+// DeleteRoom deletes a room by ID
+func (r *repository) DeleteRoom(ctx context.Context, roomID bson.ObjectID) error {
+	_, err := r.rooms.DeleteOne(ctx, bson.M{"_id": roomID})
+	return err
+}
+
+// DeleteMessagesByRoom deletes all messages in a room
+func (r *repository) DeleteMessagesByRoom(ctx context.Context, roomID bson.ObjectID) error {
+	_, err := r.messages.DeleteMany(ctx, bson.M{"roomId": roomID})
 	return err
 }

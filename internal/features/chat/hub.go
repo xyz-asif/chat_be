@@ -70,6 +70,7 @@ func (h *Hub) writePump(client *clientContext) {
 
 // Run starts the hub's main event loop
 func (h *Hub) Run() {
+	log.Printf("[HUB] Hub event loop started")
 	for {
 		select {
 		case client := <-h.register:
@@ -79,6 +80,7 @@ func (h *Hub) Run() {
 				h.clients[client.userID] = make(map[*clientContext]bool)
 			}
 			h.clients[client.userID][client] = true
+			connCount := len(h.clients[client.userID])
 			h.clientsMu.Unlock()
 			
 			// Cancel grace period if user reconnected
@@ -86,10 +88,11 @@ func (h *Hub) Run() {
 			
 			// Start the dedicated writer for this connection
 			go h.writePump(client)
-			log.Printf("User %s connected (total conns: %d)", client.userID, len(h.clients[client.userID]))
+			log.Printf("[HUB] User %s registered (connections: %d, wasOffline: %v)", client.userID, connCount, wasOffline)
 			
 			// Trigger online callback if this was the first connection
 			if wasOffline && h.onUserOnline != nil {
+				log.Printf("[HUB] Triggering online callback for user %s", client.userID)
 				h.onUserOnline(client.userID)
 			}
 
@@ -103,10 +106,11 @@ func (h *Hub) Run() {
 					if remainingConns == 0 {
 						delete(h.clients, client.userID)
 					}
-					log.Printf("User %s disconnected (remaining conns: %d)", client.userID, remainingConns)
+					log.Printf("[HUB] User %s unregistered (remaining: %d)", client.userID, remainingConns)
 					
 					// Start grace period if this was the last connection
 					if remainingConns == 0 {
+						log.Printf("[HUB] Starting grace period for user %s", client.userID)
 						h.startGracePeriod(client.userID)
 					}
 				}

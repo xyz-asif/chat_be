@@ -53,11 +53,12 @@ func (h *Handler) AcceptRequest(c *fiber.Ctx) error {
 		return response.BadRequest(c, "connection id is required")
 	}
 
-	if err := h.service.AcceptRequest(c.Context(), user.ID.Hex(), connID); err != nil {
+	conn, err := h.service.AcceptRequest(c.Context(), user.ID.Hex(), connID)
+	if err != nil {
 		return response.BadRequest(c, err.Error())
 	}
 
-	return response.OK(c, "Request accepted", nil)
+	return response.OK(c, "Request accepted", conn)
 }
 
 func (h *Handler) RejectRequest(c *fiber.Ctx) error {
@@ -104,4 +105,42 @@ func (h *Handler) GetFriendsList(c *fiber.Ctx) error {
 	}
 
 	return response.OK(c, "Friends retrieved", friends)
+}
+
+// CancelRequest allows the sender to cancel a pending request
+func (h *Handler) CancelRequest(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	connID := c.Params("id")
+	if connID == "" {
+		return response.BadRequest(c, "connection id is required")
+	}
+
+	if err := h.service.CancelRequest(c.Context(), user.ID.Hex(), connID); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Request cancelled successfully", nil)
+}
+
+// RemoveConnection allows either party to remove an accepted connection
+func (h *Handler) RemoveConnection(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	connID := c.Params("id")
+	if connID == "" {
+		return response.BadRequest(c, "connection id is required")
+	}
+
+	if err := h.service.RemoveConnection(c.Context(), user.ID.Hex(), connID); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Connection removed successfully", nil)
 }

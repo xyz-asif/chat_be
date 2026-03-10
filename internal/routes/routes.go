@@ -26,6 +26,7 @@ func SetupRoutes(
 	// ── User Routes ──
 	usersGroup := api.Group("/users")
 	usersGroup.Get("/search", authMiddleware.VerifyToken, userHandler.Search)
+	usersGroup.Get("/search-with-status", authMiddleware.VerifyToken, userHandler.SearchWithConnectionStatus)
 	usersGroup.Get("/me", authMiddleware.VerifyToken, userHandler.GetMe)
 	usersGroup.Patch("/me", authMiddleware.VerifyToken, userHandler.UpdateProfile)
 	usersGroup.Post("/:id/follow", authMiddleware.VerifyToken, userHandler.FollowUser)
@@ -36,6 +37,8 @@ func SetupRoutes(
 	connGroup.Post("/request", authMiddleware.VerifyToken, connectionHandler.SendRequest)
 	connGroup.Post("/:id/accept", authMiddleware.VerifyToken, connectionHandler.AcceptRequest)
 	connGroup.Post("/:id/reject", authMiddleware.VerifyToken, connectionHandler.RejectRequest)
+	connGroup.Post("/:id/cancel", authMiddleware.VerifyToken, connectionHandler.CancelRequest)
+	connGroup.Delete("/:id", authMiddleware.VerifyToken, connectionHandler.RemoveConnection)
 	connGroup.Get("/pending", authMiddleware.VerifyToken, connectionHandler.GetPendingRequests)
 	connGroup.Get("/friends", authMiddleware.VerifyToken, connectionHandler.GetFriendsList)
 
@@ -48,6 +51,7 @@ func SetupRoutes(
 	chatGroup.Get("/rooms/:roomId/messages", authMiddleware.VerifyToken, chatHandler.GetRoomMessages)
 	chatGroup.Post("/rooms/:roomId/messages", authMiddleware.VerifyToken, chatHandler.SendMessage)
 	chatGroup.Post("/rooms/:roomId/read", authMiddleware.VerifyToken, chatHandler.MarkRoomAsRead)
+	chatGroup.Delete("/rooms/:roomId", authMiddleware.VerifyToken, chatHandler.DeleteChat)
 
 	// Messages
 	chatGroup.Patch("/messages/:messageId/status", authMiddleware.VerifyToken, chatHandler.UpdateMessageStatus)

@@ -23,6 +23,7 @@ type Service interface {
 	FollowUser(ctx context.Context, followerID, followedUserID string) error
 	UnfollowUser(ctx context.Context, followerID, followedUserID string) error
 	SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error)
+	SearchUsersWithConnectionStatus(ctx context.Context, currentUserID, query string, limit, offset int) (*UserSearchResult, error)
 	GetFeed(ctx context.Context, userID string) ([]interface{}, error)
 }
 
@@ -35,6 +36,7 @@ type service struct {
 
 type ConnectionRepository interface {
 	GetUserConnections(ctx context.Context, userID bson.ObjectID, status string) ([]models.Connection, error)
+	GetConnectionBetweenUsers(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Connection, error)
 }
 
 type ChatRepository interface {
@@ -291,4 +293,97 @@ func (s *service) SearchUsers(ctx context.Context, query string, limit, offset i
 // Placeholder for feed
 func (s *service) GetFeed(ctx context.Context, userID string) ([]interface{}, error) {
 	return []interface{}{}, nil
+}
+
+// UserWithConnection represents a user with their connection status to the current user
+type UserWithConnection struct {
+	models.User
+	ConnectionStatus string `json:"connectionStatus"` // none, pending_sent, pending_received, accepted, rejected, blocked
+	ConnectionID     string `json:"connectionId,omitempty"`
+	IsSender         bool   `json:"isSender,omitempty"` // true if current user sent the request
+}
+
+// UserSearchResult contains the paginated search results
+type UserSearchResult struct {
+	Users      []UserWithConnection `json:"users"`
+	TotalCount int                  `json:"totalCount"`
+	HasMore    bool                 `json:"hasMore"`
+}
+
+// SearchUsersWithConnectionStatus searches for users and includes connection status
+// If query is empty, returns all users (excluding the current user) with pagination
+func (s *service) SearchUsersWithConnectionStatus(ctx context.Context, currentUserID, query string, limit, offset int) (*UserSearchResult, error) {
+	// Validate pagination
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Convert current user ID
+	currentUserObjID, err := bson.ObjectIDFromHex(currentUserID)
+	if err != nil {
+		return nil, errors.New("invalid current user id")
+	}
+
+	// Search users
+	users, err := s.repo.SearchUsers(ctx, query, limit+1, offset) // +1 to check if there's more
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := len(users) > limit
+	if hasMore {
+		users = users[:limit] // Remove the extra item
+	}
+
+	// Build result with connection status
+	result := &UserSearchResult{
+		Users:      make([]UserWithConnection, 0, len(users)),
+		TotalCount: 0, // Will be set if we implement count query
+		HasMore:    hasMore,
+	}
+
+	for _, user := range users {
+		// Skip the current user
+		if user.ID == currentUserObjID {
+			continue
+		}
+
+		userWithConn := UserWithConnection{
+			User:             user,
+			ConnectionStatus: "none",
+		}
+
+		// Check if there's a connection between current user and this user
+		conn, err := s.connRepo.GetConnectionBetweenUsers(ctx, currentUserObjID, user.ID)
+		if err != nil {
+			log.Printf("Error getting connection status for user %s: %v", user.ID.Hex(), err)
+			// Continue without connection info
+		} else if conn != nil {
+			userWithConn.ConnectionStatus = conn.Status
+			userWithConn.ConnectionID = conn.ID.Hex()
+			
+			// Determine if current user is the sender
+			if conn.SenderID == currentUserObjID {
+				userWithConn.IsSender = true
+				if conn.Status == models.ConnectionStatusPending {
+					userWithConn.ConnectionStatus = "pending_sent"
+				}
+			} else if conn.ReceiverID == currentUserObjID {
+				userWithConn.IsSender = false
+				if conn.Status == models.ConnectionStatusPending {
+					userWithConn.ConnectionStatus = "pending_received"
+				}
+			}
+		}
+
+		result.Users = append(result.Users, userWithConn)
+	}
+
+	return result, nil
 }
