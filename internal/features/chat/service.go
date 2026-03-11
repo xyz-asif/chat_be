@@ -11,6 +11,7 @@ import (
 
 	"github.com/gofiber/contrib/websocket"
 	"github.com/xyz-asif/gotodo/internal/features/connections"
+	"github.com/xyz-asif/gotodo/internal/features/notifications"
 	"github.com/xyz-asif/gotodo/internal/features/users"
 	"github.com/xyz-asif/gotodo/internal/models"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -29,29 +30,32 @@ type Service interface {
 	DeleteMessage(ctx context.Context, userID, messageID string) error
 	DeleteChat(ctx context.Context, userID, roomID string) error
 	HandleWebSocket(c *websocket.Conn, userID string)
+	ForceDisconnect(userID string)
 }
 
 type service struct {
-	repo     Repository
-	userRepo users.Repository
-	connRepo connections.Repository
-	hub      *Hub
+	repo         Repository
+	userRepo     users.Repository
+	connRepo     connections.Repository
+	hub          *Hub
+	notifService notifications.Service
 }
 
-func NewService(repo Repository, userRepo users.Repository, connRepo connections.Repository, hub *Hub) Service {
+func NewService(repo Repository, userRepo users.Repository, connRepo connections.Repository, hub *Hub, notifService notifications.Service) Service {
 	svc := &service{
-		repo:     repo,
-		userRepo: userRepo,
-		connRepo: connRepo,
-		hub:      hub,
+		repo:         repo,
+		userRepo:     userRepo,
+		connRepo:     connRepo,
+		hub:          hub,
+		notifService: notifService,
 	}
-	
+
 	// Wire presence callbacks to avoid circular dependency
 	hub.SetPresenceCallbacks(
 		func(userID string) { svc.broadcastUserPresence(userID, true) },
 		func(userID string) { svc.broadcastUserPresence(userID, false) },
 	)
-	
+
 	return svc
 }
 
@@ -181,6 +185,34 @@ func (s *service) SendMessage(ctx context.Context, senderIDStr, roomIDStr, conte
 			"lastSenderId":    senderIDStr,
 		},
 	})
+
+	// Send notification to offline participants only
+	if s.notifService != nil {
+		// Look up sender name (reuses userRepo already available)
+		senderName := "Someone"
+		if sender, err := s.userRepo.GetUserByID(ctx, senderID); err == nil && sender != nil {
+			senderName = sender.DisplayName
+		}
+		for _, p := range room.Participants {
+			pHex := p.Hex()
+			if pHex != senderIDStr {
+				isOnline := s.hub.IsUserOnline(pHex)
+				log.Printf("[NOTIF DEBUG] User %s isOnline=%v for message in room %s", pHex, isOnline, roomIDStr)
+				if !isOnline {
+					_ = s.notifService.Send(ctx, models.SendNotificationRequest{
+						RecipientID:  p,
+						ActorID:      senderID,
+						Type:         models.NotifTypeNewMessage,
+						ResourceType: models.ResourceTypeChatRoom,
+						ResourceID:   roomIDStr,
+						Title:        senderName,
+						Body:         preview,
+						GroupKey:     "msg:" + roomIDStr, // groups messages per room
+					})
+				}
+			}
+		}
+	}
 
 	return resp, nil
 }
@@ -497,7 +529,7 @@ func (s *service) DeleteChat(ctx context.Context, userIDStr, roomIDStr string) e
 				break
 			}
 		}
-		
+
 		// Find and delete the connection
 		conn, err := s.connRepo.GetConnectionBetweenUsers(ctx, userID, otherUserID)
 		if err == nil && conn != nil {
@@ -635,6 +667,23 @@ func (s *service) UpdateMessageReaction(ctx context.Context, userIDStr, messageI
 	return nil
 }
 
+// ForceDisconnect manually marks a user as offline and broadcasts to all participants.
+// Call this when the app terminates or goes to background.
+func (s *service) ForceDisconnect(userID string) {
+	log.Printf("[WS] ForceDisconnect called for user %s", userID)
+	
+	// Mark as manually offline first
+	s.hub.SetManualPresence(userID, false)
+	
+	// Cancel any grace period
+	s.hub.CancelGracePeriod(userID)
+	
+	// Broadcast offline status
+	s.broadcastUserPresence(userID, false)
+	
+	log.Printf("[WS] User %s forcefully marked as offline", userID)
+}
+
 // broadcastUserPresence notifies all unique participants across the user's rooms
 // that the user has come online or gone offline. Called on WS connect/disconnect.
 func (s *service) broadcastUserPresence(userID string, online bool) {
@@ -758,12 +807,15 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 
 	log.Printf("[WS] New WebSocket connection for user %s from %s", userID, c.RemoteAddr().String())
 
-	// Set up read deadline for dead connection detection
-	// Reset on every message read (including JSON pings)
-	if err := c.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+	// Set up read deadline - 60 seconds to detect dead connections faster
+	// This will be reset on every message read
+	if err := c.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
 		log.Printf("[WS ERROR] Failed to set read deadline for user %s: %v", userID, err)
 		return
 	}
+
+	// Track last pong time for connection health
+	lastPongTime := time.Now()
 
 	client := &clientContext{
 		userID: userID,
@@ -783,18 +835,20 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 		log.Printf("[WS ERROR] Failed to send welcome message to user %s (buffer full)", userID)
 	}
 
+	// Start ping pump for keepalive
+	stopPingPump := make(chan struct{})
+	go s.pingPump(c, client, stopPingPump, &lastPongTime)
+
 	defer func() {
+		close(stopPingPump)
 		log.Printf("[WS] Unregistering client for user %s", userID)
 		s.hub.unregister <- client
 	}()
 
-	// Start ping pump for keepalive
-	go s.pingPump(c, client)
-
 	messageCount := 0
 	for {
 		// Reset read deadline on every message (including JSON pings)
-		if err := c.SetReadDeadline(time.Now().Add(45 * time.Second)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
 			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
 			break
 		}
@@ -815,10 +869,17 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 		if messageCount <= 5 || messageCount%100 == 0 {
 			log.Printf("[WS] Received message #%d from user %s: type=%s", messageCount, userID, msg.Type)
 		}
+		
+		// Reset deadline after each message
+		if err := c.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
+			break
+		}
 
 		switch msg.Type {
 		case "ping":
-			// Client sent ping, respond with pong
+			// Client sent ping, respond with pong and track it
+			lastPongTime = time.Now()
 			pongMsg, _ := json.Marshal(map[string]string{"type": "pong"})
 			select {
 			case client.send <- pongMsg:
@@ -989,39 +1050,51 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 	return resp
 }
 
-// pingPump sends periodic ping messages through the send channel.
-// This maintains the single-writer guarantee (writePump only touches the WebSocket).
-func (s *service) pingPump(c *websocket.Conn, client *clientContext) {
+// pingPump sends periodic ping messages and monitors connection health.
+// If no pong received within 45 seconds, closes the connection.
+func (s *service) pingPump(c *websocket.Conn, client *clientContext, stop chan struct{}, lastPongTime *time.Time) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("pingPump panic recovered for user %s: %v", client.userID, r)
+			log.Printf("[WS PANIC] pingPump panic recovered for user %s: %v", client.userID, r)
 		}
 	}()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		// Check if client is still registered in hub
-		s.hub.clientsMu.RLock()
-		conns := s.hub.clients[client.userID]
-		_, stillRegistered := conns[client]
-		s.hub.clientsMu.RUnlock()
-
-		if !stillRegistered {
-			return // client was unregistered, stop pinging
-		}
-
-		// Send JSON pong through the send channel (single writer)
-		pingMsg, _ := json.Marshal(map[string]string{"type": "pong"})
+	for {
 		select {
-		case client.send <- pingMsg:
-			// Sent successfully
-		default:
-			// Buffer full — connection is likely dead
-			log.Printf("pingPump: send buffer full for user %s, closing", client.userID)
-			c.Close()
+		case <-stop:
 			return
+		case <-ticker.C:
+			// Check if client is still registered in hub
+			s.hub.clientsMu.RLock()
+			conns := s.hub.clients[client.userID]
+			_, stillRegistered := conns[client]
+			s.hub.clientsMu.RUnlock()
+
+			if !stillRegistered {
+				return // client was unregistered, stop pinging
+			}
+
+			// Check if we've received a pong in the last 45 seconds
+			if time.Since(*lastPongTime) > 45*time.Second {
+				log.Printf("[WS HEALTH] No pong from user %s for 45s, closing connection", client.userID)
+				c.Close()
+				return
+			}
+
+			// Send JSON pong through the send channel (single writer)
+			pingMsg, _ := json.Marshal(map[string]string{"type": "pong"})
+			select {
+			case client.send <- pingMsg:
+				// Sent successfully
+			default:
+				// Buffer full — connection is likely dead
+				log.Printf("[WS ERROR] pingPump: send buffer full for user %s, closing", client.userID)
+				c.Close()
+				return
+			}
 		}
 	}
 }

@@ -263,3 +263,19 @@ func (h *Handler) DeleteChat(c *fiber.Ctx) error {
 
 	return response.OK(c, "Chat deleted successfully", nil)
 }
+
+// Disconnect Endpoint (`POST /api/v1/chat/disconnect`)
+// Call this when app goes to background or terminates to immediately mark user offline
+func (h *Handler) Disconnect(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	log.Printf("[WS] Manual disconnect requested for user %s", user.ID.Hex())
+	
+	// Broadcast offline status immediately via HTTP (for when WS is already closed)
+	go h.service.ForceDisconnect(user.ID.Hex())
+
+	return response.OK(c, "Disconnect signal sent", nil)
+}

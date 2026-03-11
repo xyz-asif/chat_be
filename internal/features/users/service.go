@@ -25,13 +25,14 @@ type Service interface {
 	SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error)
 	SearchUsersWithConnectionStatus(ctx context.Context, currentUserID, query string, limit, offset int) (*UserSearchResult, error)
 	GetFeed(ctx context.Context, userID string) ([]interface{}, error)
+	RegisterFCMToken(ctx context.Context, userID, token string) error
 }
 
 type service struct {
-	repo        Repository
-	hub         HubSender
-	connRepo    ConnectionRepository
-	chatRepo    ChatRepository
+	repo     Repository
+	hub      HubSender
+	connRepo ConnectionRepository
+	chatRepo ChatRepository
 }
 
 type ConnectionRepository interface {
@@ -45,10 +46,10 @@ type ChatRepository interface {
 
 func NewService(repo Repository, hub HubSender, connRepo ConnectionRepository, chatRepo ChatRepository) Service {
 	return &service{
-		repo:        repo,
-		hub:         hub,
-		connRepo:    connRepo,
-		chatRepo:    chatRepo,
+		repo:     repo,
+		hub:      hub,
+		connRepo: connRepo,
+		chatRepo: chatRepo,
 	}
 }
 
@@ -82,7 +83,7 @@ func (s *service) GetUsersByIDs(ctx context.Context, userIDs []string) (map[stri
 	for i, idStr := range userIDs {
 		id, err := bson.ObjectIDFromHex(idStr)
 		if err != nil {
-			return nil, errors.New("invalid user ID: "+idStr)
+			return nil, errors.New("invalid user ID: " + idStr)
 		}
 		objectIDs[i] = id
 	}
@@ -295,6 +296,14 @@ func (s *service) GetFeed(ctx context.Context, userID string) ([]interface{}, er
 	return []interface{}{}, nil
 }
 
+func (s *service) RegisterFCMToken(ctx context.Context, userID, token string) error {
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return err
+	}
+	return s.repo.AddFCMToken(ctx, uid, token)
+}
+
 // UserWithConnection represents a user with their connection status to the current user
 type UserWithConnection struct {
 	models.User
@@ -367,7 +376,7 @@ func (s *service) SearchUsersWithConnectionStatus(ctx context.Context, currentUs
 		} else if conn != nil {
 			userWithConn.ConnectionStatus = conn.Status
 			userWithConn.ConnectionID = conn.ID.Hex()
-			
+
 			// Determine if current user is the sender
 			if conn.SenderID == currentUserObjID {
 				userWithConn.IsSender = true

@@ -5,17 +5,18 @@ import (
 	"errors"
 	"log"
 
+	"github.com/xyz-asif/gotodo/internal/features/notifications"
 	"github.com/xyz-asif/gotodo/internal/models"
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 type HubBroadcaster interface {
 	SendToUsers(userIDs []string, msg models.WSMessage) error
+	SendMessage(userID string, msg models.WSMessage) error
 }
 
 type ChatRoomCreator interface {
-	GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error)
-	buildRoomResponse(ctx context.Context, room *models.Room, forUserID string) (*models.RoomResponse, error)
+	GetOrCreateDirectRoom(ctx context.Context, user1ID, user2ID string) (*models.RoomResponse, error)
 }
 
 type Service interface {
@@ -28,17 +29,22 @@ type Service interface {
 	GetFriendsList(ctx context.Context, userID string) ([]models.Connection, error)
 	GetConnectionStatus(ctx context.Context, userID, targetUserID string) (*models.Connection, error)
 	SetHub(hub HubBroadcaster)
+	SetChatService(chat ChatRoomCreator)
 }
 
 type service struct {
-	repo Repository
-	hub  HubBroadcaster
-	chat ChatRoomCreator
+	repo         Repository
+	hub          HubBroadcaster
+	chat         ChatRoomCreator
+	notifService notifications.Service
+	userLookup   notifications.UserLookup
 }
 
-func NewService(repo Repository) Service {
+func NewService(repo Repository, notifService notifications.Service, userLookup notifications.UserLookup) Service {
 	svc := &service{
-		repo: repo,
+		repo:         repo,
+		notifService: notifService,
+		userLookup:   userLookup,
 	}
 	return svc
 }
@@ -105,6 +111,23 @@ func (s *service) SendRequest(ctx context.Context, senderIDStr, receiverIDStr st
 		return nil, err
 	}
 
+	// Send notification to receiver
+	if s.notifService != nil {
+		senderName := "Someone"
+		if sender, err := s.userLookup.GetUserByID(ctx, senderID); err == nil && sender != nil {
+			senderName = sender.DisplayName
+		}
+		_ = s.notifService.Send(ctx, models.SendNotificationRequest{
+			RecipientID:  receiverID,
+			ActorID:      senderID,
+			Type:         models.NotifTypeConnectionRequest,
+			ResourceType: models.ResourceTypeConnection,
+			ResourceID:   conn.ID.Hex(),
+			Title:        "New friend request",
+			Body:         senderName + " sent you a friend request",
+		})
+	}
+
 	return conn, nil
 }
 
@@ -138,20 +161,43 @@ func (s *service) AcceptRequest(ctx context.Context, userIDStr, connectionIDStr 
 
 	conn.Status = models.ConnectionStatusAccepted
 
+	// Send notification to original sender that their request was accepted
+	if s.notifService != nil {
+		acceptorName := "Someone"
+		if acceptor, err := s.userLookup.GetUserByID(ctx, userID); err == nil && acceptor != nil {
+			acceptorName = acceptor.DisplayName
+		}
+		_ = s.notifService.Send(ctx, models.SendNotificationRequest{
+			RecipientID:  conn.SenderID,
+			ActorID:      userID,
+			Type:         models.NotifTypeConnectionAccepted,
+			ResourceType: models.ResourceTypeConnection,
+			ResourceID:   conn.ID.Hex(),
+			Title:        "Request accepted",
+			Body:         acceptorName + " accepted your friend request",
+		})
+	}
+
 	// Create the chat room immediately when connection is accepted
-	var roomResponse *models.RoomResponse
+	var senderRoom, receiverRoom *models.RoomResponse
 	if s.chat != nil {
-		room, err := s.chat.GetOrCreateDirectRoomAtomic(ctx, conn.SenderID, conn.ReceiverID)
+		senderID := conn.SenderID.Hex()
+		receiverID := conn.ReceiverID.Hex()
+		
+		// Create room and get sender's perspective
+		sRoom, err := s.chat.GetOrCreateDirectRoom(ctx, senderID, receiverID)
 		if err != nil {
 			log.Printf("[CONN] Failed to create room for accepted connection: %v", err)
 		} else {
-			// Build room response for both users
-			senderRoom, err := s.chat.buildRoomResponse(ctx, room, conn.SenderID.Hex())
-			if err != nil {
-				log.Printf("[CONN] Failed to build room response for sender: %v", err)
-			} else {
-				roomResponse = senderRoom
-			}
+			senderRoom = sRoom
+		}
+		
+		// Get receiver's perspective (same room, different viewer)
+		rRoom, err := s.chat.GetOrCreateDirectRoom(ctx, receiverID, senderID)
+		if err != nil {
+			log.Printf("[CONN] Failed to get room for receiver: %v", err)
+		} else {
+			receiverRoom = rRoom
 		}
 	}
 
@@ -160,26 +206,37 @@ func (s *service) AcceptRequest(ctx context.Context, userIDStr, connectionIDStr 
 		senderID := conn.SenderID.Hex()
 		receiverID := conn.ReceiverID.Hex()
 
-		// Notify both users about the new connection and room
-		payload := map[string]interface{}{
+		// Notify sender with their room perspective
+		senderPayload := map[string]interface{}{
 			"connectionId": conn.ID.Hex(),
 			"senderId":     senderID,
 			"receiverId":   receiverID,
 			"status":       "accepted",
 			"message":      "You are now connected! Start chatting.",
-			"room":         roomResponse, // Include the room immediately
+			"room":         senderRoom,
 		}
-
-		wsMsg := models.WSMessage{
+		senderMsg := models.WSMessage{
 			Type:    "connection_accepted",
-			Payload: payload,
+			Payload: senderPayload,
 		}
+		_ = s.hub.SendMessage(senderID, senderMsg)
 
-		if err := s.hub.SendToUsers([]string{senderID, receiverID}, wsMsg); err != nil {
-			log.Printf("[CONN] Failed to broadcast connection_accepted: %v", err)
-		} else {
-			log.Printf("[CONN] Broadcasted connection_accepted with room to %s and %s", senderID, receiverID)
+		// Notify receiver with their room perspective
+		receiverPayload := map[string]interface{}{
+			"connectionId": conn.ID.Hex(),
+			"senderId":     senderID,
+			"receiverId":   receiverID,
+			"status":       "accepted",
+			"message":      "You are now connected! Start chatting.",
+			"room":         receiverRoom,
 		}
+		receiverMsg := models.WSMessage{
+			Type:    "connection_accepted",
+			Payload: receiverPayload,
+		}
+		_ = s.hub.SendMessage(receiverID, receiverMsg)
+
+		log.Printf("[CONN] Broadcasted connection_accepted to sender %s and receiver %s", senderID, receiverID)
 	}
 
 	return conn, nil

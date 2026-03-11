@@ -12,6 +12,7 @@ import (
 	"github.com/xyz-asif/gotodo/internal/database"
 	"github.com/xyz-asif/gotodo/internal/features/chat"
 	"github.com/xyz-asif/gotodo/internal/features/connections"
+	"github.com/xyz-asif/gotodo/internal/features/notifications"
 	"github.com/xyz-asif/gotodo/internal/features/users"
 	"github.com/xyz-asif/gotodo/internal/middleware"
 	"github.com/xyz-asif/gotodo/internal/routes"
@@ -45,10 +46,20 @@ func main() {
 	chatHub := chat.NewHub()
 	go chatHub.Run() // Run the hub in a background goroutine
 
+	// Initialize notification system
+	notifRepo := notifications.NewRepository(db.Database)
+	fcmSender := notifications.NewFirebaseFCM(cfg.FirebaseCredsPath, cfg.FirebaseProjectID)
+	notifService := notifications.NewService(notifRepo, userRepo, chatHub, fcmSender)
+	notifHandler := notifications.NewHandler(notifService)
+
 	// Initialize services
 	userService := users.NewService(userRepo, chatHub, connectionRepo, chatRepo)
-	connectionService := connections.NewService(connectionRepo)
-	chatService := chat.NewService(chatRepo, userRepo, connectionRepo, chatHub)
+	connectionService := connections.NewService(connectionRepo, notifService, userRepo)
+	chatService := chat.NewService(chatRepo, userRepo, connectionRepo, chatHub, notifService)
+
+	// Wire up dependencies for real-time room creation
+	connectionService.SetHub(chatHub)
+	connectionService.SetChatService(chatService)
 
 	// Initialize handlers
 	userHandler := users.NewHandler(userService)
@@ -83,6 +94,7 @@ func main() {
 		userHandler,
 		connectionHandler,
 		chatHandler,
+		notifHandler,
 	)
 	// 8. Start Server
 	log.Printf("🚀 Starting Chat API on port %s", cfg.Port)

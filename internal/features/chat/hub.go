@@ -105,11 +105,11 @@ func (h *Hub) Run() {
 					remainingConns := len(conns)
 					if remainingConns == 0 {
 						delete(h.clients, client.userID)
-					}
-					log.Printf("[HUB] User %s unregistered (remaining: %d)", client.userID, remainingConns)
-					
-					// Start grace period if this was the last connection
-					if remainingConns == 0 {
+						// Clear manual presence — user has no connections, they're truly offline
+						h.manualMu.Lock()
+						delete(h.manualOffline, client.userID)
+						h.manualMu.Unlock()
+
 						log.Printf("[HUB] Starting grace period for user %s", client.userID)
 						h.startGracePeriod(client.userID)
 					}

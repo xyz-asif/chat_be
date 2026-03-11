@@ -21,6 +21,8 @@ type Repository interface {
 	FollowUser(ctx context.Context, followerID, followedID bson.ObjectID) error
 	UnfollowUser(ctx context.Context, followerID, followedID bson.ObjectID) error
 	SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error)
+	AddFCMToken(ctx context.Context, userID bson.ObjectID, token string) error
+	RemoveFCMTokens(ctx context.Context, userID bson.ObjectID, tokens []string) error
 }
 
 type repository struct {
@@ -244,4 +246,29 @@ func (r *repository) GetUsersByIDs(ctx context.Context, ids []bson.ObjectID) (ma
 	}
 
 	return userMap, nil
+}
+
+// AddFCMToken adds a token if not already present (idempotent).
+func (r *repository) AddFCMToken(ctx context.Context, userID bson.ObjectID, token string) error {
+	_, _ = r.collection.UpdateOne(ctx,
+		bson.M{"_id": userID, "fcmTokens": nil},
+		bson.M{"$set": bson.M{"fcmTokens": []string{}}},
+	)
+	_, err := r.collection.UpdateOne(ctx,
+		bson.M{"_id": userID},
+		bson.M{"$addToSet": bson.M{"fcmTokens": token}},
+	)
+	return err
+}
+
+// RemoveFCMTokens removes multiple tokens from a user (idempotent $pullAll).
+func (r *repository) RemoveFCMTokens(ctx context.Context, userID bson.ObjectID, tokens []string) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+	_, err := r.collection.UpdateOne(ctx,
+		bson.M{"_id": userID},
+		bson.M{"$pullAll": bson.M{"fcmTokens": tokens}},
+	)
+	return err
 }

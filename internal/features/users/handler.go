@@ -128,3 +128,24 @@ func (h *Handler) SearchWithConnectionStatus(c *fiber.Ctx) error {
 
 	return response.OK(c, "Users retrieved with connection status", result)
 }
+
+// RegisterFCMToken saves the device's FCM token for push notifications.
+func (h *Handler) RegisterFCMToken(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Token == "" {
+		return response.BadRequest(c, "token is required")
+	}
+
+	if err := h.service.RegisterFCMToken(c.Context(), user.ID.Hex(), req.Token); err != nil {
+		return response.InternalError(c, err.Error())
+	}
+
+	return response.OK(c, "Token registered", nil)
+}

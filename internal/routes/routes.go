@@ -5,6 +5,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/xyz-asif/gotodo/internal/features/chat"
 	"github.com/xyz-asif/gotodo/internal/features/connections"
+	"github.com/xyz-asif/gotodo/internal/features/notifications"
 	"github.com/xyz-asif/gotodo/internal/features/users"
 	"github.com/xyz-asif/gotodo/internal/middleware"
 )
@@ -15,6 +16,7 @@ func SetupRoutes(
 	userHandler *users.Handler,
 	connectionHandler *connections.Handler,
 	chatHandler *chat.Handler,
+	notifHandler *notifications.Handler,
 ) {
 	api := app.Group("/api/v1")
 
@@ -29,6 +31,7 @@ func SetupRoutes(
 	usersGroup.Get("/search-with-status", authMiddleware.VerifyToken, userHandler.SearchWithConnectionStatus)
 	usersGroup.Get("/me", authMiddleware.VerifyToken, userHandler.GetMe)
 	usersGroup.Patch("/me", authMiddleware.VerifyToken, userHandler.UpdateProfile)
+	usersGroup.Post("/me/fcm-token", authMiddleware.VerifyToken, userHandler.RegisterFCMToken)
 	usersGroup.Post("/:id/follow", authMiddleware.VerifyToken, userHandler.FollowUser)
 	usersGroup.Delete("/:id/follow", authMiddleware.VerifyToken, userHandler.UnfollowUser)
 
@@ -61,7 +64,15 @@ func SetupRoutes(
 
 	// Presence
 	chatGroup.Get("/users/:id/presence", authMiddleware.VerifyToken, chatHandler.GetUserPresence)
+	chatGroup.Post("/disconnect", authMiddleware.VerifyToken, chatHandler.Disconnect)
 
 	// WebSocket
 	chatGroup.Get("/ws", authMiddleware.VerifyToken, chatHandler.WsUpgrade, websocket.New(chatHandler.WebSocketHandle))
+
+	// ── Notification Routes ──
+	notifGroup := api.Group("/notifications")
+	notifGroup.Get("/", authMiddleware.VerifyToken, notifHandler.GetNotifications)
+	notifGroup.Get("/unread-count", authMiddleware.VerifyToken, notifHandler.GetUnreadCount)
+	notifGroup.Post("/:id/read", authMiddleware.VerifyToken, notifHandler.MarkAsRead)
+	notifGroup.Post("/read-all", authMiddleware.VerifyToken, notifHandler.MarkAllAsRead)
 }
