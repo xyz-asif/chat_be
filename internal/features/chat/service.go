@@ -807,9 +807,9 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 
 	log.Printf("[WS] New WebSocket connection for user %s from %s", userID, c.RemoteAddr().String())
 
-	// Set up read deadline - 60 seconds to detect dead connections faster
+	// Set up read deadline - 30 seconds to detect dead connections faster
 	// This will be reset on every message read
-	if err := c.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		log.Printf("[WS ERROR] Failed to set read deadline for user %s: %v", userID, err)
 		return
 	}
@@ -848,7 +848,7 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 	messageCount := 0
 	for {
 		// Reset read deadline on every message (including JSON pings)
-		if err := c.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
 			break
 		}
@@ -871,7 +871,7 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 		}
 		
 		// Reset deadline after each message
-		if err := c.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
 			break
 		}

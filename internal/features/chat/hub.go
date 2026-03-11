@@ -186,6 +186,22 @@ func (h *Hub) startGracePeriod(userID string) {
 	if timer, ok := h.gracePeriods[userID]; ok {
 		timer.Stop()
 	}
+	
+	// Check if manually marked offline - broadcast immediately, no grace period
+	h.manualMu.RLock()
+	manuallyOffline := h.manualOffline[userID]
+	h.manualMu.RUnlock()
+	
+	if manuallyOffline {
+		// User manually went offline - broadcast immediately with no grace period
+		h.graceMu.Unlock()
+		if h.onUserOffline != nil {
+			log.Printf("[HUB] User %s manually offline, broadcasting immediately", userID)
+			h.onUserOffline(userID)
+		}
+		return
+	}
+	
 	h.gracePeriods[userID] = time.AfterFunc(graceDuration, func() {
 		// Wait a tiny bit for any pending register to be processed
 		time.Sleep(100 * time.Millisecond)
@@ -198,17 +214,7 @@ func (h *Hub) startGracePeriod(userID string) {
 			return
 		}
 		
-		// Skip if already handled by manual presence
-		h.manualMu.RLock()
-		manuallyOffline := h.manualOffline[userID]
-		h.manualMu.RUnlock()
-		if manuallyOffline {
-			h.graceMu.Lock()
-			delete(h.gracePeriods, userID)
-			h.graceMu.Unlock()
-			return
-		}
-		
+		// Broadcast offline
 		if h.onUserOffline != nil {
 			h.onUserOffline(userID)
 		}
