@@ -667,8 +667,9 @@ func (s *service) UpdateMessageReaction(ctx context.Context, userIDStr, messageI
 	return nil
 }
 
-// ForceDisconnect manually marks a user as offline and broadcasts to all participants.
+// ForceDisconnect manually marks a user as offline and closes WebSocket connections.
 // Call this when the app terminates or goes to background.
+// The actual offline broadcast will happen when WebSocket connections close.
 func (s *service) ForceDisconnect(userID string) {
 	log.Printf("[WS] ForceDisconnect called for user %s", userID)
 	
@@ -678,8 +679,8 @@ func (s *service) ForceDisconnect(userID string) {
 	// Cancel any grace period
 	s.hub.CancelGracePeriod(userID)
 	
-	// Broadcast offline status
-	s.broadcastUserPresence(userID, false)
+	// Close all WebSocket connections for this user
+	s.hub.DisconnectUser(userID)
 	
 	log.Printf("[WS] User %s forcefully marked as offline", userID)
 }
@@ -807,9 +808,9 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 
 	log.Printf("[WS] New WebSocket connection for user %s from %s", userID, c.RemoteAddr().String())
 
-	// Set up read deadline - 30 seconds to detect dead connections faster
+	// Set up read deadline - 15 seconds to detect dead connections faster
 	// This will be reset on every message read
-	if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	if err := c.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		log.Printf("[WS ERROR] Failed to set read deadline for user %s: %v", userID, err)
 		return
 	}
@@ -848,7 +849,7 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 	messageCount := 0
 	for {
 		// Reset read deadline on every message (including JSON pings)
-		if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
 			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
 			break
 		}
@@ -871,15 +872,19 @@ func (s *service) HandleWebSocket(c *websocket.Conn, userID string) {
 		}
 		
 		// Reset deadline after each message
-		if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
 			log.Printf("[WS ERROR] Failed to reset read deadline for user %s: %v", userID, err)
 			break
 		}
 
 		switch msg.Type {
-		case "ping":
-			// Client sent ping, respond with pong and track it
+		case "pong":
+			// Client responded to our ping - update last pong time
 			lastPongTime = time.Now()
+			log.Printf("[WS] Pong received from user %s", userID)
+
+		case "ping":
+			// Client sent ping, respond with pong (legacy support)
 			pongMsg, _ := json.Marshal(map[string]string{"type": "pong"})
 			select {
 			case client.send <- pongMsg:
@@ -1051,7 +1056,8 @@ func (s *service) buildMessageResponse(ctx context.Context, msg *models.Message)
 }
 
 // pingPump sends periodic ping messages and monitors connection health.
-// If no pong received within 45 seconds, closes the connection.
+// If no pong received within 10 seconds, closes the connection.
+// Backend sends "ping", client should respond with "pong".
 func (s *service) pingPump(c *websocket.Conn, client *clientContext, stop chan struct{}, lastPongTime *time.Time) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1059,7 +1065,7 @@ func (s *service) pingPump(c *websocket.Conn, client *clientContext, stop chan s
 		}
 	}()
 
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -1077,15 +1083,15 @@ func (s *service) pingPump(c *websocket.Conn, client *clientContext, stop chan s
 				return // client was unregistered, stop pinging
 			}
 
-			// Check if we've received a pong in the last 45 seconds
-			if time.Since(*lastPongTime) > 45*time.Second {
-				log.Printf("[WS HEALTH] No pong from user %s for 45s, closing connection", client.userID)
+			// Check if we've received a pong in the last 10 seconds
+			if time.Since(*lastPongTime) > 10*time.Second {
+				log.Printf("[WS HEALTH] No pong from user %s for 10s, closing connection", client.userID)
 				c.Close()
 				return
 			}
 
-			// Send JSON pong through the send channel (single writer)
-			pingMsg, _ := json.Marshal(map[string]string{"type": "pong"})
+			// Send JSON ping through the send channel (single writer)
+			pingMsg, _ := json.Marshal(map[string]string{"type": "ping"})
 			select {
 			case client.send <- pingMsg:
 				// Sent successfully

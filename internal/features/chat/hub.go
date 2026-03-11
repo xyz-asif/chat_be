@@ -107,11 +107,20 @@ func (h *Hub) Run() {
 						delete(h.clients, client.userID)
 						// Clear manual presence — user has no connections, they're truly offline
 						h.manualMu.Lock()
+						wasManuallyOffline := h.manualOffline[client.userID]
 						delete(h.manualOffline, client.userID)
 						h.manualMu.Unlock()
 
-						log.Printf("[HUB] Starting grace period for user %s", client.userID)
-						h.startGracePeriod(client.userID)
+						// Skip grace period if user was manually marked offline
+						if wasManuallyOffline {
+							log.Printf("[HUB] User %s was manually offline, no grace period", client.userID)
+							if h.onUserOffline != nil {
+								h.onUserOffline(client.userID)
+							}
+						} else {
+							log.Printf("[HUB] Starting grace period for user %s", client.userID)
+							h.startGracePeriod(client.userID)
+						}
 					}
 				}
 			}
@@ -265,4 +274,20 @@ func (h *Hub) OnlineUserCount() int {
 	h.clientsMu.RLock()
 	defer h.clientsMu.RUnlock()
 	return len(h.clients)
+}
+
+// DisconnectUser closes all WebSocket connections for a specific user
+func (h *Hub) DisconnectUser(userID string) {
+	h.clientsMu.RLock()
+	conns, ok := h.clients[userID]
+	h.clientsMu.RUnlock()
+	
+	if !ok {
+		return
+	}
+	
+	// Close all connections for this user
+	for client := range conns {
+		client.conn.Close()
+	}
 }
