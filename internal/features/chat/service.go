@@ -22,6 +22,12 @@ type Service interface {
 	GetOrCreateDirectRoom(ctx context.Context, user1ID, user2ID string) (*models.RoomResponse, error)
 	GetRoomMessages(ctx context.Context, userID, roomID string, limit int, beforeID string) (*models.MessagesPage, error)
 	GetUserRooms(ctx context.Context, userID string) ([]models.RoomResponse, error)
+	// GetUserRoomsWithSearch returns paginated chat list with optional search
+	// searchQuery: optional text to search in participant names or room names
+	// limit: items per page (default 20, max 50)
+	// offset: number of items to skip
+	// Returns rooms, total count, hasMore flag, and error
+	GetUserRoomsWithSearch(ctx context.Context, userID, searchQuery string, limit, offset int) ([]models.RoomResponse, int64, bool, error)
 	GetUserPresence(ctx context.Context, userID string) (map[string]interface{}, error)
 	UpdateMessageStatus(ctx context.Context, userID, messageID, status string) error
 	UpdateMessageReaction(ctx context.Context, userID, messageID, emoji string) error
@@ -331,6 +337,59 @@ func (s *service) GetUserRooms(ctx context.Context, userIDStr string) ([]models.
 	}
 
 	return responses, nil
+}
+
+// GetUserRoomsWithSearch returns paginated chat rooms with optional search.
+// Supports searching by participant display names or room names (for groups).
+func (s *service) GetUserRoomsWithSearch(ctx context.Context, userIDStr, searchQuery string, limit, offset int) ([]models.RoomResponse, int64, bool, error) {
+	userID, err := bson.ObjectIDFromHex(userIDStr)
+	if err != nil {
+		return nil, 0, false, errors.New("invalid user id")
+	}
+
+	// Validate pagination parameters
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Normalize search query
+	searchQuery = strings.TrimSpace(searchQuery)
+
+	// Get paginated rooms from repository
+	rooms, totalCount, err := s.repo.GetUserRoomsWithSearch(ctx, userID, searchQuery, limit, offset)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	// Calculate hasMore flag
+	hasMore := int64(offset+len(rooms)) < totalCount
+
+	// If no rooms found, return early
+	if len(rooms) == 0 {
+		return []models.RoomResponse{}, totalCount, hasMore, nil
+	}
+
+	// Build responses using buildRoomResponse (handles user fetching internally)
+	responses := make([]models.RoomResponse, 0, len(rooms))
+	for _, r := range rooms {
+		resp, err := s.buildRoomResponse(ctx, &r, userIDStr)
+		if err != nil {
+			log.Printf("[SERVICE] GetUserRoomsWithSearch: failed to build room response for room %s: %v", r.ID.Hex(), err)
+			continue
+		}
+		responses = append(responses, *resp)
+	}
+
+	log.Printf("[SERVICE] GetUserRoomsWithSearch: user=%s, query=%q, returned=%d, total=%d, hasMore=%v",
+		userIDStr, searchQuery, len(responses), totalCount, hasMore)
+
+	return responses, totalCount, hasMore, nil
 }
 
 func (s *service) MarkRoomAsRead(ctx context.Context, userIDStr, roomIDStr string) error {
@@ -1083,9 +1142,9 @@ func (s *service) pingPump(c *websocket.Conn, client *clientContext, stop chan s
 				return // client was unregistered, stop pinging
 			}
 
-			// Check if we've received a pong in the last 10 seconds
-			if time.Since(*lastPongTime) > 10*time.Second {
-				log.Printf("[WS HEALTH] No pong from user %s for 10s, closing connection", client.userID)
+			// Check if we've received a pong in the last 35 seconds
+			if time.Since(*lastPongTime) > 35*time.Second {
+				log.Printf("[WS HEALTH] No pong from user %s for 35s, closing connection", client.userID)
 				c.Close()
 				return
 			}

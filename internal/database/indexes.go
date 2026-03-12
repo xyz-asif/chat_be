@@ -19,6 +19,8 @@ func CreateIndexes(ctx context.Context, db *mongo.Database) error {
 		{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true).SetSparse(true)},
 		// Text index for user search
 		{Keys: bson.D{{Key: "displayName", Value: "text"}, {Key: "email", Value: "text"}}},
+		// Index for displayName regex search in chat list
+		{Keys: bson.D{{Key: "displayName", Value: 1}}},
 	}
 	if _, err := db.Collection("users").Indexes().CreateMany(ctx, usersIndexes); err != nil {
 		log.Printf("Warning: Users index creation issue: %v", err)
@@ -51,6 +53,8 @@ func CreateIndexes(ctx context.Context, db *mongo.Database) error {
 		{Keys: bson.D{{Key: "participants", Value: 1}, {Key: "lastUpdated", Value: -1}}},
 		// Fast lookup: find existing direct room between two people
 		{Keys: bson.D{{Key: "type", Value: 1}, {Key: "participants", Value: 1}}},
+		// Index for searching rooms by participant IDs (for $in queries)
+		{Keys: bson.D{{Key: "participants", Value: 1}}},
 	}
 	if _, err := db.Collection("chat_rooms").Indexes().CreateMany(ctx, roomsIndexes); err != nil {
 		log.Printf("Warning: Chat rooms index creation issue: %v", err)
