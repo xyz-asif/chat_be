@@ -67,6 +67,19 @@ func CreateIndexes(ctx context.Context, db *mongo.Database) error {
 		log.Printf("Warning: Chat messages index creation issue: %v", err)
 	}
 
+	// ── Notifications ──
+	notifsIndexes := []mongo.IndexModel{
+		// Primary query: paginated list for a user, newest first
+		{Keys: bson.D{{Key: "recipientId", Value: 1}, {Key: "_id", Value: -1}}},
+		// Unread count query
+		{Keys: bson.D{{Key: "recipientId", Value: 1}, {Key: "isRead", Value: 1}}},
+		// Grouping lookup (find existing unread notification with same groupKey)
+		{Keys: bson.D{{Key: "recipientId", Value: 1}, {Key: "groupKey", Value: 1}, {Key: "isRead", Value: 1}}},
+	}
+	if _, err := db.Collection("notifications").Indexes().CreateMany(ctx, notifsIndexes); err != nil {
+		log.Printf("Warning: Notifications index creation issue: %v", err)
+	}
+
 	log.Println("✅ All MongoDB indexes created successfully")
 	return nil
 }

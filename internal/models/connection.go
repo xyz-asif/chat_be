@@ -22,10 +22,10 @@ type Connection struct {
 	Status              string        `bson:"status" json:"status"` // pending, accepted, rejected, blocked
 	SenderDisplayName   string        `bson:"-" json:"senderDisplayName,omitempty"`
 	SenderEmail         string        `bson:"-" json:"senderEmail,omitempty"`
-	SenderPhotoURL      string        `bson:"-" json:"senderPhotoUrl,omitempty"`
+	SenderPhotoURL      string        `bson:"-" json:"senderPhotoURL,omitempty"`
 	ReceiverDisplayName string        `bson:"-" json:"receiverDisplayName,omitempty"`
 	ReceiverEmail       string        `bson:"-" json:"receiverEmail,omitempty"`
-	ReceiverPhotoURL    string        `bson:"-" json:"receiverPhotoUrl,omitempty"`
+	ReceiverPhotoURL    string        `bson:"-" json:"receiverPhotoURL,omitempty"`
 	CreatedAt           time.Time     `bson:"createdAt" json:"createdAt"`
 	UpdatedAt           time.Time     `bson:"updatedAt" json:"updatedAt"`
 }

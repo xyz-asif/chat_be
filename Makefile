@@ -1,7 +1,7 @@
 # Makefile for GoTodo
 # Usage: run `make <target>`
 
-.PHONY: help tidy build run run-api test lint air install-air docker-build docker-run fmt clean
+.PHONY: help tidy build run run-api test lint air install-air docker-build docker-run fmt clean kill restart
 
 ## help: Show this help
 help:
@@ -21,6 +21,14 @@ run:
 
 ## run-api: Alias for run
 run-api: run ## Run the API server
+
+## kill: Kill any running Go processes on port 8080
+kill:
+	@echo "Killing any processes on port 8080..."
+	@lsof -ti:8080 | xargs kill -9 2>/dev/null || echo "No processes found on port 8080"
+
+## restart: Kill existing server and run fresh
+restart: kill run ## Kill server and restart
 
 ## test: Run tests (if any)
 test:
@@ -55,4 +63,8 @@ docker-run:
 ## clean: Remove build artifacts
 clean:
 	rm -rf bin
+
+## db-reset: Drop the chat_db database to start fresh
+db-reset:
+	mongosh chat_db --eval "db.dropDatabase()"
 

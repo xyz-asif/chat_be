@@ -734,3 +734,122 @@ For all errors, the response body is:
 | `GET` | `/chat/users/:id/presence` | Yes | Get user online status (on-demand) |
 | `WS` | `/chat/ws?token=<token>` | Yes | WebSocket connection |
 | `GET` | `/health` | No | Health check |
+
+---
+
+## 13. User Search with Connection Status (NEW)
+
+### `GET /users/search-with-status`
+
+Search for users with pagination. Returns users along with their connection status relative to the authenticated user.
+
+#### Query Parameters
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `q` | string | No | `""` | Search query (searches display name and email) |
+| `limit` | int | No | `20` | Results per page (max 50) |
+| `offset` | int | No | `0` | Number of results to skip |
+
+#### Response
+```json
+{
+  "success": true,
+  "message": "Users retrieved with connection status",
+  "data": {
+    "users": [
+      {
+        "id": "user_id",
+        "displayName": "John Doe",
+        "email": "john@example.com",
+        "photoURL": "https://...",
+        "connectionStatus": "pending_sent",
+        "connectionId": "conn_id",
+        "isSender": true
+      }
+    ],
+    "totalCount": 0,
+    "hasMore": true
+  }
+}
+```
+
+#### Connection Status Values
+- `none` - No connection, show "Add Friend" button
+- `pending_sent` - You sent request, show "Pending" + "Cancel" button
+- `pending_received` - They sent request, show "Accept" + "Reject" buttons
+- `accepted` - Friends, show "Unfriend" button
+- `rejected` - Previous request rejected, can resend
+- `blocked` - Blocked, no action available
+
+---
+
+## 14. Cancel Friend Request (NEW)
+
+### `POST /connections/:id/cancel`
+
+Cancel a pending friend request that you sent.
+
+#### Response
+```json
+{
+  "success": true,
+  "message": "Request cancelled successfully"
+}
+```
+
+**Note:** Only the sender can cancel their own request.
+
+---
+
+## 15. Remove Connection / Unfriend (NEW)
+
+### `DELETE /connections/:id`
+
+Remove an existing connection (unfriend) or delete a pending request.
+
+#### Response
+```json
+{
+  "success": true,
+  "message": "Connection removed successfully"
+}
+```
+
+**Note:** 
+- For accepted connections: Either party can unfriend
+- For pending requests: Either party can remove
+- Chat history is NOT deleted (use Delete Chat API for that)
+
+---
+
+## 16. Delete Chat (NEW)
+
+### `DELETE /chat/rooms/:roomId`
+
+Delete a chat room and ALL its messages. For direct chats, this also unfriends the user.
+
+⚠️ **Warning:** This action is permanent and cannot be undone!
+
+#### Response
+```json
+{
+  "success": true,
+  "message": "Chat deleted successfully"
+}
+```
+
+**What gets deleted:**
+- All messages in the room (permanent)
+- The room itself (permanent)
+- For direct chats: The connection between users (unfriends)
+
+---
+
+## Updated API Summary Table
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/users/search-with-status` | Yes | Search users with connection status |
+| `POST` | `/connections/:id/cancel` | Yes | Cancel sent friend request |
+| `DELETE` | `/connections/:id` | Yes | Remove connection / unfriend |
+| `DELETE` | `/chat/rooms/:roomId` | Yes | Delete chat + history + unfriend |

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gofiber/contrib/websocket"
 	"github.com/xyz-asif/gotodo/internal/models"
@@ -15,8 +16,12 @@ const sendBufSize = 256
 type Hub struct {
 	clients       map[string]map[*clientContext]bool
 	clientsMu     sync.RWMutex
-	disconnecting map[string]bool // users in process of disconnecting
-	discMu        sync.RWMutex
+	manualOffline map[string]bool // users manually marked offline (app in background)
+	manualMu      sync.RWMutex
+	gracePeriods  map[string]*time.Timer // users in grace period after disconnect
+	graceMu       sync.RWMutex
+	onUserOnline  func(userID string)     // callback when user comes online
+	onUserOffline func(userID string)     // callback when user goes offline
 	register      chan *clientContext
 	unregister    chan *clientContext
 	broadcast     chan broadcastMessage
@@ -40,10 +45,11 @@ type broadcastMessage struct {
 func NewHub() *Hub {
 	return &Hub{
 		clients:       make(map[string]map[*clientContext]bool),
-		disconnecting: make(map[string]bool),
+		manualOffline: make(map[string]bool),
+		gracePeriods:  make(map[string]*time.Timer),
 		register:      make(chan *clientContext, 64),
 		unregister:    make(chan *clientContext, 64),
-		broadcast:     make(chan broadcastMessage, 256),
+		broadcast:     make(chan broadcastMessage, 1024),
 	}
 }
 
@@ -64,18 +70,31 @@ func (h *Hub) writePump(client *clientContext) {
 
 // Run starts the hub's main event loop
 func (h *Hub) Run() {
+	log.Printf("[HUB] Hub event loop started")
 	for {
 		select {
 		case client := <-h.register:
 			h.clientsMu.Lock()
+			wasOffline := len(h.clients[client.userID]) == 0
 			if h.clients[client.userID] == nil {
 				h.clients[client.userID] = make(map[*clientContext]bool)
 			}
 			h.clients[client.userID][client] = true
+			connCount := len(h.clients[client.userID])
 			h.clientsMu.Unlock()
+			
+			// Cancel grace period if user reconnected
+			h.CancelGracePeriod(client.userID)
+			
 			// Start the dedicated writer for this connection
 			go h.writePump(client)
-			log.Printf("User %s connected (total conns: %d)", client.userID, len(h.clients[client.userID]))
+			log.Printf("[HUB] User %s registered (connections: %d, wasOffline: %v)", client.userID, connCount, wasOffline)
+			
+			// Trigger online callback if this was the first connection
+			if wasOffline && h.onUserOnline != nil {
+				log.Printf("[HUB] Triggering online callback for user %s", client.userID)
+				h.onUserOnline(client.userID)
+			}
 
 		case client := <-h.unregister:
 			h.clientsMu.Lock()
@@ -83,17 +102,29 @@ func (h *Hub) Run() {
 				if _, exists := conns[client]; exists {
 					delete(conns, client)
 					close(client.send) // signals writePump to exit
-					if len(conns) == 0 {
+					remainingConns := len(conns)
+					if remainingConns == 0 {
 						delete(h.clients, client.userID)
+						// Clear manual presence — user has no connections, they're truly offline
+						h.manualMu.Lock()
+						wasManuallyOffline := h.manualOffline[client.userID]
+						delete(h.manualOffline, client.userID)
+						h.manualMu.Unlock()
+
+						// Skip grace period if user was manually marked offline
+						if wasManuallyOffline {
+							log.Printf("[HUB] User %s was manually offline, no grace period", client.userID)
+							if h.onUserOffline != nil {
+								h.onUserOffline(client.userID)
+							}
+						} else {
+							log.Printf("[HUB] Starting grace period for user %s", client.userID)
+							h.startGracePeriod(client.userID)
+						}
 					}
-					log.Printf("User %s disconnected", client.userID)
 				}
 			}
 			h.clientsMu.Unlock()
-			// Clear disconnecting flag after processing
-			h.discMu.Lock()
-			delete(h.disconnecting, client.userID)
-			h.discMu.Unlock()
 
 		case msg := <-h.broadcast:
 			h.clientsMu.RLock()
@@ -134,23 +165,103 @@ func (h *Hub) SendMessage(userID string, msg models.WSMessage) error {
 	return h.SendToUsers([]string{userID}, msg)
 }
 
-// MarkDisconnecting marks a user as in the process of disconnecting.
-// This ensures IsUserOnline returns false immediately, even before unregister is processed.
-func (h *Hub) MarkDisconnecting(userID string) {
-	h.discMu.Lock()
-	h.disconnecting[userID] = true
-	h.discMu.Unlock()
+// SetPresenceCallbacks sets the online/offline callbacks for presence broadcasting
+// Must be called after service is created to avoid circular dependency
+func (h *Hub) SetPresenceCallbacks(onOnline, onOffline func(userID string)) {
+	h.onUserOnline = onOnline
+	h.onUserOffline = onOffline
+}
+
+// SetManualPresence marks a user as manually online/offline (for mobile app background/foreground).
+// When isOnline=false, user appears offline to others but WebSocket stays connected.
+// When isOnline=true, user's presence returns to actual connection state.
+func (h *Hub) SetManualPresence(userID string, isOnline bool) {
+	h.manualMu.Lock()
+	if isOnline {
+		delete(h.manualOffline, userID)
+	} else {
+		h.manualOffline[userID] = true
+	}
+	h.manualMu.Unlock()
+}
+
+// startGracePeriod starts a 2-second grace period before broadcasting user offline
+// This allows quick reconnections without generating offline/online events
+func (h *Hub) startGracePeriod(userID string) {
+	const graceDuration = 2 * time.Second
+
+	h.graceMu.Lock()
+	// Cancel any existing grace period
+	if timer, ok := h.gracePeriods[userID]; ok {
+		timer.Stop()
+	}
+	
+	// Check if manually marked offline - broadcast immediately, no grace period
+	h.manualMu.RLock()
+	manuallyOffline := h.manualOffline[userID]
+	h.manualMu.RUnlock()
+	
+	if manuallyOffline {
+		// User manually went offline - broadcast immediately with no grace period
+		h.graceMu.Unlock()
+		if h.onUserOffline != nil {
+			log.Printf("[HUB] User %s manually offline, broadcasting immediately", userID)
+			h.onUserOffline(userID)
+		}
+		return
+	}
+	
+	h.gracePeriods[userID] = time.AfterFunc(graceDuration, func() {
+		// Wait a tiny bit for any pending register to be processed
+		time.Sleep(100 * time.Millisecond)
+		
+		// Double-check: if user reconnected between timer start and fire
+		h.clientsMu.RLock()
+		stillConnected := len(h.clients[userID]) > 0
+		h.clientsMu.RUnlock()
+		if stillConnected {
+			return
+		}
+		
+		// Broadcast offline
+		if h.onUserOffline != nil {
+			h.onUserOffline(userID)
+		}
+		h.graceMu.Lock()
+		delete(h.gracePeriods, userID)
+		h.graceMu.Unlock()
+	})
+	h.graceMu.Unlock()
+}
+
+// CancelGracePeriod cancels any active grace period for a user
+// Called on manual presence updates and reconnections
+func (h *Hub) CancelGracePeriod(userID string) {
+	h.graceMu.Lock()
+	if timer, ok := h.gracePeriods[userID]; ok {
+		timer.Stop()
+		delete(h.gracePeriods, userID)
+		log.Printf("User %s grace period cancelled", userID)
+	}
+	h.graceMu.Unlock()
 }
 
 // IsUserOnline checks if a user has any active WebSocket connections.
-// Returns false if the user is in the process of disconnecting.
+// Returns false if the user is manually marked offline or in grace period.
 func (h *Hub) IsUserOnline(userID string) bool {
-	h.discMu.RLock()
-	if h.disconnecting[userID] {
-		h.discMu.RUnlock()
+	h.manualMu.RLock()
+	if h.manualOffline[userID] {
+		h.manualMu.RUnlock()
 		return false
 	}
-	h.discMu.RUnlock()
+	h.manualMu.RUnlock()
+
+	h.graceMu.RLock()
+	if _, inGracePeriod := h.gracePeriods[userID]; inGracePeriod {
+		h.graceMu.RUnlock()
+		return true // Still considered online during grace period
+	}
+	h.graceMu.RUnlock()
 
 	h.clientsMu.RLock()
 	defer h.clientsMu.RUnlock()
@@ -163,4 +274,20 @@ func (h *Hub) OnlineUserCount() int {
 	h.clientsMu.RLock()
 	defer h.clientsMu.RUnlock()
 	return len(h.clients)
+}
+
+// DisconnectUser closes all WebSocket connections for a specific user
+func (h *Hub) DisconnectUser(userID string) {
+	h.clientsMu.RLock()
+	conns, ok := h.clients[userID]
+	h.clientsMu.RUnlock()
+	
+	if !ok {
+		return
+	}
+	
+	// Close all connections for this user
+	for client := range conns {
+		client.conn.Close()
+	}
 }

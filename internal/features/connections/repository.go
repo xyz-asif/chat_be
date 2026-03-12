@@ -15,6 +15,8 @@ type Repository interface {
 	GetConnectionByID(ctx context.Context, id bson.ObjectID) (*models.Connection, error)
 	GetConnectionBetweenUsers(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Connection, error)
 	UpdateConnectionStatus(ctx context.Context, id bson.ObjectID, status string) error
+	UpdateConnectionDirection(ctx context.Context, id bson.ObjectID, newSenderID, newReceiverID bson.ObjectID) error
+	DeleteConnection(ctx context.Context, id bson.ObjectID) error
 	GetUserConnections(ctx context.Context, userID bson.ObjectID, status string) ([]models.Connection, error)
 }
 
@@ -82,6 +84,24 @@ func (r *repository) UpdateConnectionStatus(ctx context.Context, id bson.ObjectI
 		},
 	}
 	_, err := r.collection.UpdateOne(ctx, bson.M{"_id": id}, update)
+	return err
+}
+
+func (r *repository) UpdateConnectionDirection(ctx context.Context, id bson.ObjectID, newSenderID, newReceiverID bson.ObjectID) error {
+	update := bson.M{
+		"$set": bson.M{
+			"status":     models.ConnectionStatusPending,
+			"senderId":   newSenderID,
+			"receiverId": newReceiverID,
+			"updatedAt":   time.Now(),
+		},
+	}
+	_, err := r.collection.UpdateOne(ctx, bson.M{"_id": id}, update)
+	return err
+}
+
+func (r *repository) DeleteConnection(ctx context.Context, id bson.ObjectID) error {
+	_, err := r.collection.DeleteOne(ctx, bson.M{"_id": id})
 	return err
 }
 

@@ -3,28 +3,53 @@ package users
 import (
 	"context"
 	"errors"
+	"log"
+	"time"
 
 	"github.com/xyz-asif/gotodo/internal/models"
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
+// HubSender defines the interface for sending WebSocket messages
+type HubSender interface {
+	SendToUsers(userIDs []string, msg models.WSMessage) error
+}
+
 type Service interface {
 	GetOrCreateUser(ctx context.Context, firebaseUID, email, displayName, photoURL string) (*models.User, error)
 	GetUserByID(ctx context.Context, userID string) (*models.User, error)
+	GetUsersByIDs(ctx context.Context, userIDs []string) (map[string]*models.User, error)
 	UpdateProfile(ctx context.Context, userID string, updates map[string]interface{}) (*models.User, error)
 	FollowUser(ctx context.Context, followerID, followedUserID string) error
 	UnfollowUser(ctx context.Context, followerID, followedUserID string) error
 	SearchUsers(ctx context.Context, query string, limit, offset int) ([]models.User, error)
+	SearchUsersWithConnectionStatus(ctx context.Context, currentUserID, query string, limit, offset int) (*UserSearchResult, error)
 	GetFeed(ctx context.Context, userID string) ([]interface{}, error)
+	RegisterFCMToken(ctx context.Context, userID, token string) error
 }
 
 type service struct {
-	repo Repository
+	repo     Repository
+	hub      HubSender
+	connRepo ConnectionRepository
+	chatRepo ChatRepository
 }
 
-func NewService(repo Repository) Service {
+type ConnectionRepository interface {
+	GetUserConnections(ctx context.Context, userID bson.ObjectID, status string) ([]models.Connection, error)
+	GetConnectionBetweenUsers(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Connection, error)
+}
+
+type ChatRepository interface {
+	GetUserRooms(ctx context.Context, userID bson.ObjectID) ([]models.Room, error)
+}
+
+func NewService(repo Repository, hub HubSender, connRepo ConnectionRepository, chatRepo ChatRepository) Service {
 	return &service{
-		repo: repo,
+		repo:     repo,
+		hub:      hub,
+		connRepo: connRepo,
+		chatRepo: chatRepo,
 	}
 }
 
@@ -49,6 +74,33 @@ func (s *service) GetOrCreateUser(ctx context.Context, uid, email, name, photoUR
 		return newUser, nil
 	}
 	return user, nil
+}
+
+// GetUsersByIDs fetches multiple users by their string IDs in a single batch
+func (s *service) GetUsersByIDs(ctx context.Context, userIDs []string) (map[string]*models.User, error) {
+	// Convert string IDs to ObjectIDs
+	objectIDs := make([]bson.ObjectID, len(userIDs))
+	for i, idStr := range userIDs {
+		id, err := bson.ObjectIDFromHex(idStr)
+		if err != nil {
+			return nil, errors.New("invalid user ID: " + idStr)
+		}
+		objectIDs[i] = id
+	}
+
+	// Fetch users in batch
+	userMap, err := s.repo.GetUsersByIDs(ctx, objectIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert back to string map for frontend compatibility
+	result := make(map[string]*models.User)
+	for objID, user := range userMap {
+		result[objID.Hex()] = user
+	}
+
+	return result, nil
 }
 
 // MVP Launch: Get user by ID
@@ -90,7 +142,98 @@ func (s *service) UpdateProfile(ctx context.Context, userID string, updates map[
 		return nil, err
 	}
 
-	return s.repo.GetUserByID(ctx, uID)
+	updatedUser, err := s.repo.GetUserByID(ctx, uID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Broadcast profile update to friends and chat participants asynchronously
+	// This doesn't affect the API response - fire and forget
+	go s.broadcastProfileUpdate(userID, filteredUpdates, updatedUser)
+
+	return updatedUser, nil
+}
+
+// broadcastProfileUpdate sends profile changes to all users who have a connection or chat with this user
+func (s *service) broadcastProfileUpdate(userID string, updates map[string]interface{}, user *models.User) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return
+	}
+
+	// Collect unique recipient IDs
+	recipients := make(map[string]bool)
+
+	// 1. Get all friends (connections) with accepted status
+	if s.connRepo != nil {
+		connections, err := s.connRepo.GetUserConnections(ctx, uid, models.ConnectionStatusAccepted)
+		if err != nil {
+			log.Printf("broadcastProfileUpdate: failed to get friends for user %s: %v", userID, err)
+		} else {
+			for _, conn := range connections {
+				// Determine the other user in the connection
+				var friendID string
+				if conn.SenderID == uid {
+					friendID = conn.ReceiverID.Hex()
+				} else {
+					friendID = conn.SenderID.Hex()
+				}
+				if friendID != userID {
+					recipients[friendID] = true
+				}
+			}
+		}
+	}
+
+	// 2. Get all chat room participants
+	if s.chatRepo != nil {
+		rooms, err := s.chatRepo.GetUserRooms(ctx, uid)
+		if err != nil {
+			log.Printf("broadcastProfileUpdate: failed to get rooms for user %s: %v", userID, err)
+		} else {
+			for _, room := range rooms {
+				for _, p := range room.Participants {
+					pHex := p.Hex()
+					if pHex != userID {
+						recipients[pHex] = true
+					}
+				}
+			}
+		}
+	}
+
+	// If no recipients, nothing to broadcast
+	if len(recipients) == 0 {
+		return
+	}
+
+	// Convert map to slice
+	recipientList := make([]string, 0, len(recipients))
+	for id := range recipients {
+		recipientList = append(recipientList, id)
+	}
+
+	// Build payload with only changed fields + user ID
+	payload := map[string]interface{}{
+		"userId": userID,
+	}
+	for key, value := range updates {
+		payload[key] = value
+	}
+	// Always include current displayName and photoURL for consistency
+	payload["displayName"] = user.DisplayName
+	payload["photoURL"] = user.PhotoURL
+
+	// Send WebSocket message
+	if s.hub != nil {
+		_ = s.hub.SendToUsers(recipientList, models.WSMessage{
+			Type:    "profile_updated",
+			Payload: payload,
+		})
+	}
 }
 
 // MVP Launch: User-to-User Follow System - Completed
@@ -151,4 +294,105 @@ func (s *service) SearchUsers(ctx context.Context, query string, limit, offset i
 // Placeholder for feed
 func (s *service) GetFeed(ctx context.Context, userID string) ([]interface{}, error) {
 	return []interface{}{}, nil
+}
+
+func (s *service) RegisterFCMToken(ctx context.Context, userID, token string) error {
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return err
+	}
+	return s.repo.AddFCMToken(ctx, uid, token)
+}
+
+// UserWithConnection represents a user with their connection status to the current user
+type UserWithConnection struct {
+	models.User
+	ConnectionStatus string `json:"connectionStatus"` // none, pending_sent, pending_received, accepted, rejected, blocked
+	ConnectionID     string `json:"connectionId,omitempty"`
+	IsSender         bool   `json:"isSender,omitempty"` // true if current user sent the request
+}
+
+// UserSearchResult contains the paginated search results
+type UserSearchResult struct {
+	Users      []UserWithConnection `json:"users"`
+	TotalCount int                  `json:"totalCount"`
+	HasMore    bool                 `json:"hasMore"`
+}
+
+// SearchUsersWithConnectionStatus searches for users and includes connection status
+// If query is empty, returns all users (excluding the current user) with pagination
+func (s *service) SearchUsersWithConnectionStatus(ctx context.Context, currentUserID, query string, limit, offset int) (*UserSearchResult, error) {
+	// Validate pagination
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Convert current user ID
+	currentUserObjID, err := bson.ObjectIDFromHex(currentUserID)
+	if err != nil {
+		return nil, errors.New("invalid current user id")
+	}
+
+	// Search users
+	users, err := s.repo.SearchUsers(ctx, query, limit+1, offset) // +1 to check if there's more
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := len(users) > limit
+	if hasMore {
+		users = users[:limit] // Remove the extra item
+	}
+
+	// Build result with connection status
+	result := &UserSearchResult{
+		Users:      make([]UserWithConnection, 0, len(users)),
+		TotalCount: 0, // Will be set if we implement count query
+		HasMore:    hasMore,
+	}
+
+	for _, user := range users {
+		// Skip the current user
+		if user.ID == currentUserObjID {
+			continue
+		}
+
+		userWithConn := UserWithConnection{
+			User:             user,
+			ConnectionStatus: "none",
+		}
+
+		// Check if there's a connection between current user and this user
+		conn, err := s.connRepo.GetConnectionBetweenUsers(ctx, currentUserObjID, user.ID)
+		if err != nil {
+			log.Printf("Error getting connection status for user %s: %v", user.ID.Hex(), err)
+			// Continue without connection info
+		} else if conn != nil {
+			userWithConn.ConnectionStatus = conn.Status
+			userWithConn.ConnectionID = conn.ID.Hex()
+
+			// Determine if current user is the sender
+			if conn.SenderID == currentUserObjID {
+				userWithConn.IsSender = true
+				if conn.Status == models.ConnectionStatusPending {
+					userWithConn.ConnectionStatus = "pending_sent"
+				}
+			} else if conn.ReceiverID == currentUserObjID {
+				userWithConn.IsSender = false
+				if conn.Status == models.ConnectionStatusPending {
+					userWithConn.ConnectionStatus = "pending_received"
+				}
+			}
+		}
+
+		result.Users = append(result.Users, userWithConn)
+	}
+
+	return result, nil
 }

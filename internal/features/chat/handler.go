@@ -243,3 +243,39 @@ func (h *Handler) DeleteMessage(c *fiber.Ctx) error {
 
 	return response.OK(c, "Message deleted", nil)
 }
+
+// DeleteChat Endpoint (`DELETE /api/v1/chat/rooms/:roomId`)
+// Deletes the chat room, all messages, and the connection (for direct chats)
+func (h *Handler) DeleteChat(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	roomID := c.Params("roomId")
+	if roomID == "" {
+		return response.BadRequest(c, "roomId is required")
+	}
+
+	if err := h.service.DeleteChat(c.Context(), user.ID.Hex(), roomID); err != nil {
+		return response.BadRequest(c, err.Error())
+	}
+
+	return response.OK(c, "Chat deleted successfully", nil)
+}
+
+// Disconnect Endpoint (`POST /api/v1/chat/disconnect`)
+// Call this when app goes to background or terminates to immediately mark user offline
+func (h *Handler) Disconnect(c *fiber.Ctx) error {
+	user, ok := c.Locals("user").(*models.User)
+	if !ok {
+		return response.Unauthorized(c, "Unauthorized")
+	}
+
+	log.Printf("[WS] Manual disconnect requested for user %s", user.ID.Hex())
+	
+	// Broadcast offline status immediately via HTTP (for when WS is already closed)
+	go h.service.ForceDisconnect(user.ID.Hex())
+
+	return response.OK(c, "Disconnect signal sent", nil)
+}
