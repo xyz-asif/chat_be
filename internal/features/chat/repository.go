@@ -17,6 +17,11 @@ type Repository interface {
 	GetDirectRoom(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error)
 	GetOrCreateDirectRoomAtomic(ctx context.Context, user1ID, user2ID bson.ObjectID) (*models.Room, error)
 	GetUserRooms(ctx context.Context, userID bson.ObjectID) ([]models.Room, error)
+	// GetUserRoomsWithSearch returns paginated rooms with optional search by participant names or room name
+	// searchQuery: optional text to search in room names or participant display names
+	// limit: max rooms to return (capped at 50)
+	// offset: number of rooms to skip for pagination
+	GetUserRoomsWithSearch(ctx context.Context, userID bson.ObjectID, searchQuery string, limit, offset int) ([]models.Room, int64, error)
 
 	SaveMessage(ctx context.Context, msg *models.Message) error
 	GetMessageByID(ctx context.Context, messageID bson.ObjectID) (*models.Message, error)
@@ -177,6 +182,119 @@ func (r *repository) GetUserRooms(ctx context.Context, userID bson.ObjectID) ([]
 	}
 
 	return rooms, nil
+}
+
+// GetUserRoomsWithSearch returns paginated rooms with optional search.
+// Search works by:
+// 1. For empty search: returns all rooms for user (sorted by lastUpdated desc)
+// 2. For search query: searches room names (for groups) and participant display names
+// Returns rooms, total count, and error
+func (r *repository) GetUserRoomsWithSearch(ctx context.Context, userID bson.ObjectID, searchQuery string, limit, offset int) ([]models.Room, int64, error) {
+	// Validate and cap limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Base filter: user must be a participant
+	filter := bson.M{"participants": userID}
+
+	// If search query provided, we need to find matching users first
+	if searchQuery != "" && searchQuery != "*" {
+		// Search for users whose display name matches the query
+		// We'll do a case-insensitive regex search
+		userFilter := bson.M{
+			"displayName": bson.M{
+				"$regex":   searchQuery,
+				"$options": "i",
+			},
+		}
+
+		// Find matching user IDs
+		usersColl := r.db.Collection("users")
+		cursor, err := usersColl.Find(ctx, userFilter)
+		if err != nil {
+			log.Printf("[REPO] Error searching users: %v", err)
+			// Continue with empty search - will just filter by room name
+		} else {
+			var matchingUsers []struct {
+				ID bson.ObjectID `bson:"_id"`
+			}
+			if err = cursor.All(ctx, &matchingUsers); err != nil {
+				log.Printf("[REPO] Error decoding users: %v", err)
+			}
+			cursor.Close(ctx)
+
+			// Build $or filter: room name matches OR participant matches
+			var userIDs []bson.ObjectID
+			for _, u := range matchingUsers {
+				// Exclude the requesting user themselves
+				if u.ID != userID {
+					userIDs = append(userIDs, u.ID)
+				}
+			}
+
+			orConditions := []bson.M{}
+
+			// Condition 1: Room name matches search (for groups)
+			orConditions = append(orConditions, bson.M{
+				"name": bson.M{
+					"$regex":   searchQuery,
+					"$options": "i",
+				},
+			})
+
+			// Condition 2: Room has a matching participant
+			if len(userIDs) > 0 {
+				orConditions = append(orConditions, bson.M{
+					"participants": bson.M{"$in": userIDs},
+				})
+			}
+
+			if len(orConditions) > 0 {
+				filter = bson.M{
+					"$and": []bson.M{
+						{"participants": userID}, // Must be participant
+						{"$or": orConditions},     // And match search
+					},
+				}
+			}
+		}
+	}
+
+	// Get total count for pagination metadata
+	totalCount, err := r.rooms.CountDocuments(ctx, filter)
+	if err != nil {
+		log.Printf("[REPO] Error counting rooms: %v", err)
+		totalCount = 0
+	}
+
+	// Build find options with pagination
+	opts := options.Find().
+		SetSort(bson.D{{Key: "lastUpdated", Value: -1}}).
+		SetLimit(int64(limit)).
+		SetSkip(int64(offset))
+
+	cursor, err := r.rooms.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer cursor.Close(ctx)
+
+	var rooms []models.Room
+	if err = cursor.All(ctx, &rooms); err != nil {
+		return nil, 0, err
+	}
+
+	log.Printf("[REPO] GetUserRoomsWithSearch: user=%s, query=%q, limit=%d, offset=%d, found=%d, total=%d",
+		userID.Hex(), searchQuery, limit, offset, len(rooms), totalCount)
+
+	return rooms, totalCount, nil
 }
 
 func (r *repository) SaveMessage(ctx context.Context, msg *models.Message) error {

@@ -61,19 +61,62 @@ func (h *Handler) GetOrCreateDirectRoom(c *fiber.Ctx) error {
 	return response.OK(c, "Room retrieved successfully", room)
 }
 
-// GetUserRooms HTTP Endpoint to list all chats
+// GetUserRooms HTTP Endpoint to list all chats with optional search and pagination
+// Query params:
+//   - q      string search query (optional, searches participant names and room names)
+//   - limit  int    (default 20, max 50)
+//   - offset int    (default 0, for pagination)
 func (h *Handler) GetUserRooms(c *fiber.Ctx) error {
 	user, ok := c.Locals("user").(*models.User)
 	if !ok {
 		return response.Unauthorized(c, "Unauthorized")
 	}
 
+	// Parse query parameters
+	searchQuery := c.Query("q", "")
+	limit := c.QueryInt("limit", 20)
+	offset := c.QueryInt("offset", 0)
+
+	// Cap limit to prevent abuse
+	if limit > 50 {
+		limit = 50
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Use new method with search/pagination if query params provided
+	if searchQuery != "" || offset > 0 {
+		rooms, totalCount, hasMore, err := h.service.GetUserRoomsWithSearch(c.Context(), user.ID.Hex(), searchQuery, limit, offset)
+		if err != nil {
+			return response.InternalError(c, err.Error())
+		}
+
+		return response.OK(c, "Rooms retrieved", fiber.Map{
+			"rooms":      rooms,
+			"totalCount": totalCount,
+			"hasMore":    hasMore,
+			"limit":      limit,
+			"offset":     offset,
+		})
+	}
+
+	// Fall back to original method for backward compatibility
 	rooms, err := h.service.GetUserRooms(c.Context(), user.ID.Hex())
 	if err != nil {
 		return response.InternalError(c, err.Error())
 	}
 
-	return response.OK(c, "Rooms retrieved", rooms)
+	return response.OK(c, "Rooms retrieved", fiber.Map{
+		"rooms":      rooms,
+		"totalCount": len(rooms),
+		"hasMore":    false,
+		"limit":      len(rooms),
+		"offset":     0,
+	})
 }
 
 // GetRoomMessages HTTP Endpoint to fetch history (cursor-based pagination)
